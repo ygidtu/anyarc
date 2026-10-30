@@ -141,9 +141,10 @@ pub struct Capabilities { read: bool, write: bool, password: bool, multi_volume:
 ## 10. 待决问题(需用户/后续确认)
 
 1. ~~`unp` 撞名~~ 已解决:定名 `anyarc`(见 §1);
-2. 是否需要 `--compatible patool` 模式(别名 `extract`→无、保持旧动词)?:
-3. L6"明确放弃"清单是否接受(alz/freearc 等直接报错)?
-4. M3 的 udf/chm 若投入产出比差,是否降级为 v2?
+2. 是否提供 `--patool-compat` 兼容层(映射 patool 旧参数形态,服务存量脚本迁移)?还是只发布干净 CLI + MIGRATION.md?
+3. L6"明确放弃"清单是否接受:alz、freearc、zpaq、shar、wav、vhd、wim(行为 = 识别格式并明确报错+指引,`formats` 中标注"不支持")?
+4. L4 的 udf、chm 排期:进 v1(总工期 +2~3 周)还是降级 v2?
+5. (新增,低成本)是否现在就在 crates.io 发布占位版本锁定 `anyarc` 名称?
 
 ## 11. 快速复现 PoC
 
