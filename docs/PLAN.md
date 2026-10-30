@@ -38,6 +38,7 @@
    - **FreeARC magic 消歧**:防止 `*.arc` 误入 ARC 解码器;
    - **`next_entry` 必须显式 `skip()`** 目录项,Backend 封装层吸收此细节。
 4. 加密 ARJ 案例:参照工具(7z/unar)失败而 unarc-rs 正确 → 对冷门路径质量有信心,但 **ACE/ADF/DMS 需要 fuzz + 真实样本补充验证**。
+5. **带前置数据的 zip(用户 `decrypt_zip.py` 场景,2026-10-30 补充实验)**:构造 3KB 假 MP4 前缀 + zip 体实测——`file(1)` 只报 MP4(patool 必失败的真实盲区);info-zip `unzip` 也 FAIL;而 **unarc-rs 后端强制按 Zip 打开时偏移计算正确、条目全部读出**(zip-rs 同样 OK)。同时验证 WinZip AES-256(method 99)与 ZipCrypto 的密码解密均通过。唯一缺口是 `ArchiveFormat::detect()` 无 EOCD 尾部扫描(带/不带路径提示均返回 None)→ 前端补探测即可,详见 §5 L2 与 §6。
 
 ## 4. 架构设计
 
@@ -46,7 +47,7 @@ anyarc/
 ├── src/
 │   ├── main.rs          # 仅入口,解析参数 → commands
 │   ├── cli.rs           # clap 定义,与 patool 参数对齐
-│   ├── detect.rs        # magic+扩展名两级探测、复合流二跳
+│   ├── detect.rs        # magic+扩展名两级探测、复合流二跳、EOCD 反向扫描(polyglot/前置数据 zip)
 │   ├── backend/
 │   │   ├── mod.rs       # trait Backend { list / test / extract / create? }
 │   │   ├── unarc.rs     # unarc-rs 封装(rar/7z/zip/ace/arj/zoo/arc/lha/cab/tar家族/…)
@@ -90,6 +91,7 @@ pub struct Capabilities { read: bool, write: bool, password: bool, multi_volume:
 | L1 已验证 | zip jar apk epub cbz、rar cbr(含密码)、7z cb7 001(含AES)、tar 全家族、gz bz2 xz zst Z、arc arj zoo lha lzh cab | unarc-rs | PoC 通过 |
 | L1 待补验 | ace cba adf dms | unarc-rs(无参照) | PoC 自检过;M1 内做 fuzz+真实语料验证 |
 | L2 前端修复项 | 无扩展名 tar.gz/tbz/xz/zst、taz 消歧、freearc 误判 | 二跳探测 | M1 |
+| L2 偏移 zip | **带前置数据的 zip**(SFX、伪装成 mp4/exe 的 polyglot 档;`decrypt_zip.py` 场景) | 前端 EOCD 反向扫描(尾部 ≤128KB)→ CD 校验 → 按 Zip 强制打开(后端偏移处理已实测可用);含 WinZip AES-99/ZipCrypto 密码路径 | M1 |
 | L3 自写容器 | a(ar)、deb、rpm、cpio | 纯 Rust 手写(结构简单) | M2 |
 | L3 接 crate | lzma 单流(.lzma)、lzip(.lz)、lz4、bzip3、iso9660(.iso) | `lzma-rust2`/`iso9660`/`lz4`/`bzip3` crate | M2 |
 | L4 spec 重写 | udf、chm | 按公开规范纯 Rust 实现 | **Backlog 再议**(2026-10-30:需求弱,不排期) |
@@ -101,7 +103,7 @@ pub struct Capabilities { read: bool, write: bool, password: bool, multi_volume:
 
 | 命令 | v1 能力 |
 |---|---|
-| `anyarc extract [-o DIR] [--password P] [--overwrite] <arch>...` | L1–L3 全格式;分卷自动聚合 |
+| `anyarc extract [-o DIR] [--password P] [--overwrite] [--encoding enc] <arch>...` | L1–L3 全格式;分卷自动聚合;**前置数据 zip 自动 EOCD 定位并告警偏移量** |
 | `anyarc test [-v]` | 同上,只解码校验 CRC 不落盘 |
 | `anyarc list [-l/-t]` | 条目名/大小/时间 |
 | `anyarc create <out> <files>...` | **白名单**:tar(.gz/.bz2/.xz/.zst)、zip(deflate/AES)、7z(LZMA2/AES)、bz2/gz/zst/xz 单流。密码仅 zip(AES)/7z |
@@ -112,6 +114,13 @@ pub struct Capabilities { read: bool, write: bool, password: bool, multi_volume:
 
 退出码:0 成功 / 1 运行时错误 / 2 用法错误;`-q/-v`  verbosity 与 patool 对齐;全局 `--json` 输出(list/search 机器可读)。
 
+从 `decrypt_zip.py` 并入的 UX 语义(实测需求,已定):
+- **密码交互**:`--password` 缺省时从 tty 隐藏读取(也支持 `UNP_PASSWORD`→更名 `ANYARC_PASSWORD` 环境变量);
+- **密码探针**:extract 前先用最小条目做一次真实解密,密码错误立即失败,不半途解出残包;
+- **文件名编码修复**:`--encoding gbk` 等——未标 UTF-8 flag(0x800)的条目名按 cp437→指定编码重解码;默认仍按 zip 规范(cp437/UTF-8);
+- **进度输出**:大档按 条目数+字节百分比 刷行(仅 tty;`--json` 或管道时关闭);
+- **默认输出目录**:`-o` 缺省解到当前目录(patool 语义);伪装档/前置数据 zip 解包时 stderr 固定告警:`检测到 N 字节前置数据(疑似伪装/SFX),条目名偏移已自动修正`。
+
 ## 7. 测试与验收
 
 1. **Golden 语料**:patool `tests/data` 全部 fixture + `poc/ref/*.manifest` 哈希清单作为固定测试集(脚本已生成,直接搬进 CI);
@@ -120,6 +129,7 @@ pub struct Capabilities { read: bool, write: bool, password: bool, multi_volume:
 4. **差分测试**:`anyarc list/extract` vs `patool`(系统工具全装)在语料上的结果一致性;
 5. **CLI 集成测试**:移植 patool `tests/test_*.py` 场景到 `assert_cmd`;
 6. **平台矩阵**:linux-gnu/musl × x86_64/aarch64、windows-msvc、macOS,CI 全跑。
+7. **偏移/伪装 zip 专项**(源自 `decrypt_zip.py` 场景):自建 fixture 集——假 MP4/EXE 前置 + zip 体、WinZip AES-256(method 99)、ZipCrypto、GBK 文件名、SFX(带 stub)。基准用 **python zipfile**(实测 info-zip `unzip` 对该类文件也 FAIL,不可作此用例基准);验收:检测出"zip(前置数据 N 字节)"、解出条目与基准逐字节一致、错误前置(伪 EOCD)不误判。
 
 ## 8. 里程碑
 
