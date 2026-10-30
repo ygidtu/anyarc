@@ -25,6 +25,9 @@
 | 格式探测 | 内置 magic-bytes 优先(`unarc_rs::ArchiveFormat::detect`),扩展名兜底与消歧,**不依赖 `file(1)`** |
 | 写操作 | `create`/`repack` 走白名单(§6),白名单外格式一律清晰报错 |
 | 外部 helper | **彻底移除**该机制(不做 fallback shelling out;PoC 证实无必要) |
+| patool 兼容层 | **不做**(2026-10-30 拍板)。仅提供 MIGRATION.md 参数对照表 + 一次性 `anyarc migrate-patool-config` 读旧配置 |
+| 长尾格式 | L4/L6 全部转入 **Backlog 再议**(用户判定:需求弱,暂不拍板放弃也不排期);v1 行为 = 识别格式 + 明确报错指引 |
+| crates.io 占位 | **不需要**(自用项目,2026-10-30 拍板) |
 
 ## 3. PoC 已验证的事实(规划依据)
 
@@ -89,9 +92,9 @@ pub struct Capabilities { read: bool, write: bool, password: bool, multi_volume:
 | L2 前端修复项 | 无扩展名 tar.gz/tbz/xz/zst、taz 消歧、freearc 误判 | 二跳探测 | M1 |
 | L3 自写容器 | a(ar)、deb、rpm、cpio | 纯 Rust 手写(结构简单) | M2 |
 | L3 接 crate | lzma 单流(.lzma)、lzip(.lz)、lz4、bzip3、iso9660(.iso) | `lzma-rust2`/`iso9660`/`lz4`/`bzip3` crate | M2 |
-| L4 spec 重写 | udf、chm | 按公开规范纯 Rust 实现 | M3(可降级报错) |
+| L4 spec 重写 | udf、chm | 按公开规范纯 Rust 实现 | **Backlog 再议**(2026-10-30:需求弱,不排期) |
 | L5 音频容器 | flac(`claxon`)、ape(`mac`)、shn(`shorten`) | crate 接入,只读 | M3 |
-| L6 明确放弃 | alz(ARK,GPL 且用户群极小)、freearc(codec 许可证差)、zpaq/shar/wav(本就外部工具语义)、vhd/wim(需求弱) | 报错并给指引 | — |
+| L6 Backlog | alz(ARK,GPL 冲突)、freearc(codec 许可证差)、zpaq/shar/wav(本就外部工具语义)、vhd/wim(磁盘镜像) | **Backlog 再议**;过渡行为 = 识别格式 + 报错指引 | 不排期 |
 | 永久禁区 | **RAR create** | 无算法/许可证 | 文档明示 |
 
 ## 6. 命令与能力(与 patool 对齐)
@@ -124,9 +127,12 @@ pub struct Capabilities { read: bool, write: bool, password: bool, multi_volume:
 |---|---|---|---|
 | **M1 骨架** | CLI + Backend trait + detect(含二跳修复)+ L1 全量 + 安全落盘 | PoC 矩阵 100% 绿(除已知 FAIL);`anyarc extract` 日常格式可用 | 2–3 周 |
 | **M2 容器补全** | L3 自写容器 + crate 接入;`create`/`test`/`list` 白名单 | fixture 全绿;deb/rpm/cpio 与 7z 对拍一致 | 2–3 周 |
-| **M3 长尾** | L4 udf/chm spec 实现、L5 音频只读;`repack`/`diff` | patool 格式清单对齐度 ~90%(按使用频率加权) | 4–6 周 |
+| **M3 收尾** | L5 音频只读;`repack`/`diff` | patool 高频格式对齐度 ~85%(加权;Backlog 项若再议通过则补排期) | 3–4 周 |
 | **M4 发布工程** | cargo-dist 多平台矩阵、man page、shell 补全、变更日志 | 单文件 ≤25 MB,`ldd` 无依赖 | 1 周 |
 | **M5 上游反哺** | unarc-rs PR(复合探测、FreeArc magic)、测试语料共享 | PR 合并 | 持续 |
+
+**Backlog(再议池,无排期)**:udf、chm、alz、freearc、zpaq、shar、wav、vhd、wim。
+触发再议的条件:真实使用中出现需求 / 出现可靠纯 Rust 实现或宽松许可证 C 库 / 上游 fuzz 资源顺路覆盖。
 
 ## 9. 风险登记
 
@@ -138,13 +144,13 @@ pub struct Capabilities { read: bool, write: bool, password: bool, multi_volume:
 | 二进制体积(全套解码器) | 低 | 实测 PoC ~10–20 MB 可接受;按层裁剪 feature 提供 slim 构建 |
 | 与 patool 行为差异导致迁移摩擦 | 低 | CLI 参数/退出码对齐 + `formats` 能力表明示 + MIGRATION.md |
 
-## 10. 待决问题(需用户/后续确认)
+## 10. 待决问题(全部已处理,2026-10-30 用户拍板)
 
-1. ~~`unp` 撞名~~ 已解决:定名 `anyarc`(见 §1);
-2. 是否提供 `--patool-compat` 兼容层(映射 patool 旧参数形态,服务存量脚本迁移)?还是只发布干净 CLI + MIGRATION.md?
-3. L6"明确放弃"清单是否接受:alz、freearc、zpaq、shar、wav、vhd、wim(行为 = 识别格式并明确报错+指引,`formats` 中标注"不支持")?
-4. L4 的 udf、chm 排期:进 v1(总工期 +2~3 周)还是降级 v2?
-5. (新增,低成本)是否现在就在 crates.io 发布占位版本锁定 `anyarc` 名称?
+1. 命名 → **anyarc**(§1);
+2. `--patool-compat` 兼容层 → **不做**,仅 MIGRATION.md + 配置迁移命令;
+3. L6 放弃清单 → **不拍板"放弃",转 Backlog 再议**(需求弱;过渡行为=识别+报错指引);
+4. udf/chm 排期 → 同上,**转 Backlog 再议**,M3 因此瘦身至 3–4 周;
+5. crates.io 占位 → **不需要**(自用项目)。
 
 ## 11. 快速复现 PoC
 
