@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use unarc_rs::unified::{ArchiveFormat, ArchiveOptions, UnifiedArchive};
 
 const DATA: &str = "/home/zym/code/patool/tests/data";
-const REF: &str = "/home/zym/code/unp-rs/ref";
+const REF: &str = "/home/zym/code/anyarc/ref";
 const PASS: &str = "thereisnotry";
 
 type Entries = BTreeMap<String, String>; // name -> sha256

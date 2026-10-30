@@ -1,12 +1,14 @@
-# unp-rs 项目规划
+# anyarc 项目规划
 
 > 状态:规划定稿,等待实施指令
 > 前置验证:PoC 已完成,见 `docs/POC-REPORT.md`(2026-10-30)
+> 命名:推荐 **anyarc**(crates.io 空闲、发行版无撞名)。曾用名 unp-rs 已废弃(见 §1)。备选:`unpx`、`uarc`(均空闲但较弱,理由见 §1)
 
 ## 1. 立项背景与定位
 
 - **目标**:用 Rust 重写 patool 的功能,发布为**单个静态二进制**,运行时零系统依赖(用户无需安装 unrar/7z/p7zip/unar 等任何外部程序),覆盖 patool 支持的绝大多数归档格式。
-- **命名**:`unp-rs`(patool 的前身即名为 `unp`,语义延续;安装后的可执行文件名为 `unp`)。
+- **命名**:`anyarc`("any archive";二进制名与仓库名一致)。不用 `unp`(与 Debian 旧包/Perl 脚本撞名,即 patool 前身)、不用 `unarc`(上游 unarc-rs 作者已发布 `unarc-cli`,二进制就叫 `unarc`,且与 Unarrange C 库撞名)、不用 `upack`(crates.io 已被 SIMD bitpacking 库占用,2026-02)。
+- **与上游 unarc-cli 的差异化**:unarc-rs 作者自己也做了一个只读 CLI(`unarc extract/list`,偏 BBS 复古格式)。anyarc 的差异化 = patool 完整语义(`create`/`repack`/`diff`/`search` + 白名单写路径)、更广格式层(ar/deb/rpm/cpio/lzip/iso 等自写或接第二实现)、安全落盘策略与限额、迁移 UX(formats 能力表、退出码对齐)。上游库出问题时 anyarc 内可 fork 关键解码器(许可证允许)。
 - **非目标**:
   - 不追求 patool 100% 格式对齐(长尾 8 种格式分级处置,见 §5);
   - 不做 RAR **创建**(算法专有,patool 自身也依赖商业 `rar` 二进制,明确放弃);
@@ -37,7 +39,7 @@
 ## 4. 架构设计
 
 ```
-unp-rs/
+anyarc/
 ├── src/
 │   ├── main.rs          # 仅入口,解析参数 → commands
 │   ├── cli.rs           # clap 定义,与 patool 参数对齐
@@ -96,14 +98,14 @@ pub struct Capabilities { read: bool, write: bool, password: bool, multi_volume:
 
 | 命令 | v1 能力 |
 |---|---|
-| `unp extract [-o DIR] [--password P] [--overwrite] <arch>...` | L1–L3 全格式;分卷自动聚合 |
-| `unp test [-v]` | 同上,只解码校验 CRC 不落盘 |
-| `unp list [-l/-t]` | 条目名/大小/时间 |
-| `unp create <out> <files>...` | **白名单**:tar(.gz/.bz2/.xz/.zst)、zip(deflate/AES)、7z(LZMA2/AES)、bz2/gz/zst/xz 单流。密码仅 zip(AES)/7z |
-| `unp repack <in> <out>` | in 按 L1–L3 读,out 按 create 白名单 |
-| `unp diff <a> <b>` | 条目名+内容哈希差异(v1);文本级 diff(v2) |
-| `unp search <pattern> <arch>...` | 条目名匹配(v1);解流内容 grep(v2) |
-| `unp formats` / `--version` | 能力表输出 |
+| `anyarc extract [-o DIR] [--password P] [--overwrite] <arch>...` | L1–L3 全格式;分卷自动聚合 |
+| `anyarc test [-v]` | 同上,只解码校验 CRC 不落盘 |
+| `anyarc list [-l/-t]` | 条目名/大小/时间 |
+| `anyarc create <out> <files>...` | **白名单**:tar(.gz/.bz2/.xz/.zst)、zip(deflate/AES)、7z(LZMA2/AES)、bz2/gz/zst/xz 单流。密码仅 zip(AES)/7z |
+| `anyarc repack <in> <out>` | in 按 L1–L3 读,out 按 create 白名单 |
+| `anyarc diff <a> <b>` | 条目名+内容哈希差异(v1);文本级 diff(v2) |
+| `anyarc search <pattern> <arch>...` | 条目名匹配(v1);解流内容 grep(v2) |
+| `anyarc formats` / `--version` | 能力表输出 |
 
 退出码:0 成功 / 1 运行时错误 / 2 用法错误;`-q/-v`  verbosity 与 patool 对齐;全局 `--json` 输出(list/search 机器可读)。
 
@@ -112,7 +114,7 @@ pub struct Capabilities { read: bool, write: bool, password: bool, multi_volume:
 1. **Golden 语料**:patool `tests/data` 全部 fixture + `poc/ref/*.manifest` 哈希清单作为固定测试集(脚本已生成,直接搬进 CI);
 2. **真实语料扩展**:每格式收集 ≥50 个公开真实档案(BBS 老格式用 unarc-rs/icy_board 语料),与 7z/unar/bsdtar 三方输出对拍;
 3. **Fuzz**:`cargo-fuzz` 对 L1 待补验(ACE/ADF/DMS/ARJ/RAR)与自写容器(ar/deb/rpm/cpio)做解码健壮性,标准:不 panic、不超限;
-4. **差分测试**:`unp list/extract` vs `patool`(系统工具全装)在语料上的结果一致性;
+4. **差分测试**:`anyarc list/extract` vs `patool`(系统工具全装)在语料上的结果一致性;
 5. **CLI 集成测试**:移植 patool `tests/test_*.py` 场景到 `assert_cmd`;
 6. **平台矩阵**:linux-gnu/musl × x86_64/aarch64、windows-msvc、macOS,CI 全跑。
 
@@ -120,7 +122,7 @@ pub struct Capabilities { read: bool, write: bool, password: bool, multi_volume:
 
 | 里程碑 | 内容 | 验收标准 | 预估 |
 |---|---|---|---|
-| **M1 骨架** | CLI + Backend trait + detect(含二跳修复)+ L1 全量 + 安全落盘 | PoC 矩阵 100% 绿(除已知 FAIL);`unp extract` 日常格式可用 | 2–3 周 |
+| **M1 骨架** | CLI + Backend trait + detect(含二跳修复)+ L1 全量 + 安全落盘 | PoC 矩阵 100% 绿(除已知 FAIL);`anyarc extract` 日常格式可用 | 2–3 周 |
 | **M2 容器补全** | L3 自写容器 + crate 接入;`create`/`test`/`list` 白名单 | fixture 全绿;deb/rpm/cpio 与 7z 对拍一致 | 2–3 周 |
 | **M3 长尾** | L4 udf/chm spec 实现、L5 音频只读;`repack`/`diff` | patool 格式清单对齐度 ~90%(按使用频率加权) | 4–6 周 |
 | **M4 发布工程** | cargo-dist 多平台矩阵、man page、shell 补全、变更日志 | 单文件 ≤25 MB,`ldd` 无依赖 | 1 周 |
@@ -138,15 +140,15 @@ pub struct Capabilities { read: bool, write: bool, password: bool, multi_volume:
 
 ## 10. 待决问题(需用户/后续确认)
 
-1. `unp` 命令名与 Debian 旧包 `unp`(patool 前身脚本)共存是否接受?备选名:`upack`、`xunp`;
-2. 是否需要 `--compatible patool` 模式(别名 `extract`→无、保持旧动词)?建议:不做,直接干净 CLI;
+1. ~~`unp` 撞名~~ 已解决:定名 `anyarc`(见 §1);
+2. 是否需要 `--compatible patool` 模式(别名 `extract`→无、保持旧动词)?:
 3. L6"明确放弃"清单是否接受(alz/freearc 等直接报错)?
 4. M3 的 udf/chm 若投入产出比差,是否降级为 v2?
 
 ## 11. 快速复现 PoC
 
 ```bash
-cd /home/zym/code/unp-rs
+cd /home/zym/code/anyarc
 bash poc/ref_extract.sh            # 生成参照 manifest(需 7z/unar/tar/unzip/cabextract)
 cargo run --release                # 输出 130 行兼容性矩阵
 ```

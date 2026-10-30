@@ -39,6 +39,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "anyarc"
+version = "0.1.0"
+dependencies = [
+ "sevenz-rust2",
+ "sha2",
+ "unarc-rs",
+]
+
+[[package]]
 name = "autocfg"
 version = "1.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -927,15 +936,6 @@ name = "unicode-ident"
 version = "1.0.27"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a2c754d6c33795a1c324727428e5a7dedb5b06195f9890bdbcba760d3e246563"
-
-[[package]]
-name = "unp-rs"
-version = "0.1.0"
-dependencies = [
- "sevenz-rust2",
- "sha2",
- "unarc-rs",
-]
 
 [[package]]
 name = "wasm-bindgen"

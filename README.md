@@ -1,4 +1,4 @@
-# unp-rs
+# anyarc
 
 单个静态二进制的归档文件管理工具,patool 的 Rust 重写 —— 运行时零外部依赖(无需 unrar/7z/unar 等系统工具)。
 

@@ -68,7 +68,7 @@ sevenz-rust2 单独跑 7z 家族:`p .7z`(AES 头加密)、`t .7z`、`t.7z.001`(�
 ## 7. 复现方式
 
 ```bash
-cd /home/zym/code/unp-rs
+cd /home/zym/code/anyarc
 bash ref_extract.sh          # 生成 48 个参照 manifest
 cargo run --release          # 全量比对,stdout 为 markdown 表
 cargo run --release -- t.tar # 只跑匹配的 fixture
