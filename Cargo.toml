@@ -1,0 +1,9 @@
+[package]
+name = "unp-rs"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+sevenz-rust2 = "0.24.1"
+sha2 = "0.11.1"
+unarc-rs = "0.8.1"
