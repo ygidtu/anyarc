@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use clap::Parser;
 use unarc_rs::unified::ArchiveFormat;
 
-use crate::backend::{self, ArchiveBackend, EntryKind, Format, OpenOptions};
+use crate::backend::{self, ArchiveBackend, EntryKind, OpenOptions};
 use crate::detect;
 use crate::extract::{link_target_escapes, safe_join};
 
@@ -355,12 +355,13 @@ fn extract_one(
 ) -> anyhow::Result<()> {
     let dest = &args.out;
     std::fs::create_dir_all(dest)?;
-    let single = matches!(ar.format(), Format::Unarc(f) if is_single_stream(f));
+    let single = ar.is_single_file();
+    let show_bar = crate::extract::is_tty() && !args.common.quiet;
     let mut n_file = 0usize;
     let mut n_dir = 0usize;
     let mut n_skipped = 0usize;
     let mut n_overwrite_skip = 0usize;
-    let mut bar = crate::progress::ExtractBar::new(crate::extract::is_tty() && !args.common.quiet);
+    let mut bar = crate::progress::ExtractBar::new(show_bar && !single);
     // 捐赠者尚未出现的硬链接(pass 2 处理;cpio 允许 dup 排在数据条目之前)
     let mut deferred_links: Vec<(std::path::PathBuf, String)> = Vec::new();
 
@@ -390,12 +391,22 @@ fn extract_one(
                     continue;
                 }
                 bar.entry(&name);
-                let data = ar.read_current()?; // 读后条目已消费
                 if let Some(parent) = p.parent() {
                     std::fs::create_dir_all(parent)?;
                 }
-                std::fs::write(&p, &data)?;
-                bar.add_bytes(data.len());
+                let mut f = std::fs::File::create(&p)?;
+                if single {
+                    // pv 风格:总长已知 → 进度条+百分比+ETA;未知 → 字节+速率+用时。
+                    let pv = crate::progress::BytesBar::new(show_bar, "解压", (entry.size > 0).then_some(entry.size));
+                    let mut w = pv.wrap(&mut f);
+                    ar.read_current_to(&mut w)?; // 读后条目已消费
+                    drop(w);
+                    pv.finish();
+                } else {
+                    let mut w = bar.wrap(&mut f);
+                    ar.read_current_to(&mut w)?;
+                    drop(w);
+                }
                 n_file += 1;
             }
             EntryKind::Symlink => {
@@ -465,14 +476,15 @@ fn extract_one(
                     deferred_links.push((p, entry.link_target.clone().unwrap()));
                     ar.skip_current()?;
                 } else {
-                    // 降级路径:读内容写普通文件(保持可读性优先)
+                    // 降级路径:流式读内容写普通文件(保持可读性优先)
                     bar.entry(&name);
-                    let data = ar.read_current()?;
                     if let Some(parent) = p.parent() {
                         std::fs::create_dir_all(parent)?;
                     }
-                    std::fs::write(&p, &data)?;
-                    bar.add_bytes(data.len());
+                    let mut f = std::fs::File::create(&p)?;
+                    let mut w = bar.wrap(&mut f);
+                    ar.read_current_to(&mut w)?;
+                    drop(w);
                     n_file += 1;
                 }
             }

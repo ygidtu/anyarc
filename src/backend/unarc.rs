@@ -59,6 +59,10 @@ impl ArchiveBackend for UnarcBackend {
         let e = self.current.take().ok_or_else(|| anyhow::anyhow!("无当前条目(先 next_entry)"))?;
         self.inner.skip(&e).map_err(|e| anyhow::anyhow!("{e}"))
     }
+    // unarc 的 read_to 内部仍是整读(无真流式),用 trait 默认的分块写。
+    fn is_single_file(&self) -> bool {
+        matches!(self.inner.format(), ArchiveFormat::Gz | ArchiveFormat::Bz2 | ArchiveFormat::Xz | ArchiveFormat::Zst | ArchiveFormat::Z)
+    }
 }
 
 /// ArchiveEntry → 解耦 Entry(名字归一化 `\`→`/`,加密标志合并)。

@@ -109,6 +109,9 @@ impl Default for OpenOptions {
     }
 }
 
+/// 流式写入的分块大小(进度条按块推进,避免一次性跳变)。
+pub const WRITE_CHUNK: usize = 256 * 1024;
+
 /// 已打开归档的统一迭代接口。
 /// 条目以"游标"语义操作:`read_current`/`skip_current` 作用于最近一次
 /// `next_entry` 返回的条目(顺序流后端无法回读,故不提供按条目操作)。
@@ -121,6 +124,22 @@ pub trait ArchiveBackend {
     fn read_current(&mut self) -> anyhow::Result<Vec<u8>>;
     /// 跳过当前条目(目录/`--json` 列表模式用)。
     fn skip_current(&mut self) -> anyhow::Result<()>;
+    /// 单文件作业(单流压缩,解压产物恰为一个文件):extract 用 pv 风格进度条。
+    fn is_single_file(&self) -> bool {
+        false
+    }
+    /// 流式把当前条目解压数据写入 w,返回写入字节数。
+    /// 可流式的后端应覆盖(边解压边推进度);默认整读后分块写。
+    fn read_current_to(&mut self, w: &mut dyn std::io::Write) -> anyhow::Result<u64> {
+        let data = self.read_current()?;
+        let mut off = 0usize;
+        while off < data.len() {
+            let end = (off + WRITE_CHUNK).min(data.len());
+            w.write_all(&data[off..end])?;
+            off = end;
+        }
+        Ok(data.len() as u64)
+    }
 }
 
 /// 打开一个已探测过的归档,返回后端实例。分卷(7z .001 / zip .z01)在此聚合。

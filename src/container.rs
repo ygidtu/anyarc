@@ -8,7 +8,7 @@
 //! - iso:ISO9660 目录树(含 Joliet 名字),条目按存储名(去 `;1`)。
 
 use std::fs::File;
-use std::io::{Read, Seek, SeekFrom};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 use crate::backend::{ArchiveBackend, Entry, EntryKind, Format, OpenOptions};
@@ -110,6 +110,113 @@ impl ArchiveBackend for ContainerBackend {
         self.current = None; // 随机访问后端:跳过即释放游标
         Ok(())
     }
+    fn is_single_file(&self) -> bool {
+        // 单流压缩(gz/lzma/lzip/lz4)非 tar 复合、音频解码 → 计划里只有一个文件条目
+        self.plan.len() == 1 && self.plan[0].0.kind == EntryKind::File
+    }
+    /// 真流式:压缩成员边解压边分块写 w(限额用 take(cap+1) 检出超限)。
+    fn read_current_to(&mut self, w: &mut dyn Write) -> anyhow::Result<u64> {
+        let i = self.current.take().ok_or_else(|| anyhow::anyhow!("无当前条目"))?;
+        let flen = std::fs::metadata(&self.path)?.len();
+        let cap = self.max_entry_size.unwrap_or(u64::MAX);
+        match &self.plan[i].1 {
+            Fetch::Inline(b) => write_chunks(b, w),
+            Fetch::Raw { off, len } => {
+                if *off > flen || *len > flen - *off {
+                    anyhow::bail!("条目数据超出文件范围");
+                }
+                self.check_size(*len)?;
+                let mut f = File::open(&self.path)?;
+                f.seek(SeekFrom::Start(*off))?;
+                copy_chunks(f.take(*len), w)
+            }
+            Fetch::Comp { off, len, comp } => {
+                if *off > flen || *len > flen - *off {
+                    anyhow::bail!("条目数据超出文件范围");
+                }
+                let mut f = File::open(&self.path)?;
+                f.seek(SeekFrom::Start(*off))?;
+                let raw = f.take(*len);
+                let n = match comp {
+                    Comp::Gzip => copy_chunks(flate2::read::MultiGzDecoder::new(raw).take(cap.saturating_add(1)), w)?,
+                    Comp::Bzip2 => copy_chunks(bzip2::read::BzDecoder::new(raw).take(cap.saturating_add(1)), w)?,
+                    Comp::Zstd => {
+                        let d = zstd::stream::read::Decoder::new(raw)?;
+                        copy_chunks(d.take(cap.saturating_add(1)), w)?
+                    }
+                    Comp::Lz4 => copy_chunks(lz4_flex::frame::FrameDecoder::new(raw).take(cap.saturating_add(1)), w)?,
+                    Comp::Lzip => copy_chunks(lzma_rust2::LzipReader::new(raw).take(cap.saturating_add(1)), w)?,
+                    Comp::Xz => {
+                        // 借用 unarc 的纯 Rust XZ 解码器(无 Read 包装,整读后分块写)
+                        let cur = std::io::BufReader::new(raw);
+                        let mut a = unarc_rs::xz::XzArchive::new(cur).map_err(|e| anyhow::anyhow!("{e}"))?;
+                        let v = a.read_with_limit(Some(cap)).map_err(|e| anyhow::anyhow!("{e}"))?;
+                        write_chunks(&v, w)?
+                    }
+                    Comp::LzmaAlone => {
+                        let mut r = std::io::BufReader::new(raw);
+                        let mut sink = CappedWrite { w, written: 0, cap, overflow: false };
+                        if let Err(e) = lzma_rs::lzma_decompress(&mut r, &mut sink) {
+                            if sink.overflow {
+                                anyhow::bail!("解压尺寸超过上限 {cap}(--max-entry-size)");
+                            }
+                            anyhow::bail!("lzma: {e}");
+                        }
+                        sink.written
+                    }
+                };
+                if n > cap {
+                    anyhow::bail!("解压尺寸超过上限 {cap}(--max-entry-size)");
+                }
+                Ok(n)
+            }
+        }
+    }
+}
+
+/// 分块转发 r → w(每块触发调用方的进度回调)。
+fn copy_chunks(mut r: impl Read, w: &mut dyn Write) -> anyhow::Result<u64> {
+    let mut buf = vec![0u8; crate::backend::WRITE_CHUNK];
+    let mut total = 0u64;
+    loop {
+        let n = r.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        w.write_all(&buf[..n])?;
+        total += n as u64;
+    }
+    Ok(total)
+}
+
+fn write_chunks(b: &[u8], w: &mut dyn Write) -> anyhow::Result<u64> {
+    for chunk in b.chunks(crate::backend::WRITE_CHUNK) {
+        w.write_all(chunk)?;
+    }
+    Ok(b.len() as u64)
+}
+
+/// 限额写入器(写穿到内层 w;超 cap 报错,供限额检出)。
+struct CappedWrite<'a> {
+    w: &'a mut dyn Write,
+    written: u64,
+    cap: u64,
+    overflow: bool,
+}
+
+impl Write for CappedWrite<'_> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if self.written + buf.len() as u64 > self.cap {
+            self.overflow = true;
+            return Err(std::io::Error::new(std::io::ErrorKind::WriteZero, "size limit"));
+        }
+        self.w.write_all(buf)?;
+        self.written += buf.len() as u64;
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.w.flush()
+    }
 }
 
 pub(crate) fn decompress(comp: Comp, raw: &[u8], cap: u64) -> anyhow::Result<Vec<u8>> {
@@ -163,6 +270,66 @@ pub(crate) fn decompress(comp: Comp, raw: &[u8], cap: u64) -> anyhow::Result<Vec
     Ok(out)
 }
 
+/// 只解压前 512B 判定 tar 复合;流损坏返回残缺/空(真报错留给全量解压)。
+fn decompress_head(comp: Comp, data: &[u8]) -> Vec<u8> {
+    let cur = std::io::Cursor::new(data);
+    let mut out = Vec::new();
+    match comp {
+        Comp::Gzip => {
+            let _ = flate2::read::MultiGzDecoder::new(cur).take(512).read_to_end(&mut out);
+        }
+        Comp::Bzip2 => {
+            let _ = bzip2::read::BzDecoder::new(cur).take(512).read_to_end(&mut out);
+        }
+        Comp::Zstd => {
+            if let Ok(d) = zstd::stream::read::Decoder::new(cur) {
+                let _ = d.take(512).read_to_end(&mut out);
+            }
+        }
+        Comp::Lz4 => {
+            let _ = lz4_flex::frame::FrameDecoder::new(cur).take(512).read_to_end(&mut out);
+        }
+        Comp::Lzip => {
+            let _ = lzma_rust2::LzipReader::new(cur).take(512).read_to_end(&mut out);
+        }
+        Comp::LzmaAlone => {
+            let mut r = std::io::BufReader::new(cur);
+            let mut cw = Capped { out: &mut out, cap: 512, overflow: false };
+            let _ = lzma_rs::lzma_decompress(&mut r, &mut cw);
+        }
+        Comp::Xz => {
+            if let Ok(mut a) = unarc_rs::xz::XzArchive::new(std::io::BufReader::new(cur)) {
+                out = a.read_with_limit(Some(512)).unwrap_or_default();
+            }
+        }
+    }
+    out
+}
+
+/// 流头部/尾部元数据估算解压总长(供进度条/ETA;None = 未知)。
+fn stream_total(comp: Comp, data: &[u8]) -> Option<u64> {
+    match comp {
+        // gzip 尾 ISIZE(mod 2^32):单成员 <4 GiB 精确;多成员只见末成员,
+        // 超出估算时 BytesBar 自动降级为无总长模式。
+        Comp::Gzip if data.len() >= 10 => {
+            let isize_b: [u8; 4] = data[data.len() - 4..].try_into().ok()?;
+            Some(u32::from_le_bytes(isize_b) as u64)
+        }
+        // LZMA-alone 头:props(1) + 字典大小 u32 LE(4) + 解压尺寸 u64 LE(8,全 1 = 未知)。
+        Comp::LzmaAlone if data.len() >= 13 => {
+            let sz_b: [u8; 8] = data[5..13].try_into().ok()?;
+            let sz = u64::from_le_bytes(sz_b);
+            (sz != u64::MAX).then_some(sz)
+        }
+        // lz4 frame(与 lz4_flex 解析器同布局):magic(4) FLG(1) BD(1) [CSIZE(8)]。
+        Comp::Lz4 if data.len() >= 14 && &data[..4] == b"\x04\x22\x4d\x18" && data[4] & 0b0000_1000 != 0 => {
+            let cs: [u8; 8] = data[6..14].try_into().ok()?;
+            Some(u64::from_le_bytes(cs))
+        }
+        _ => None,
+    }
+}
+
 /// detect 已确定容器种类,这里分派解析器。
 pub fn open(path: &Path, det: &Detected, opts: &OpenOptions) -> anyhow::Result<Box<dyn ArchiveBackend>> {
     let container = match det.kind {
@@ -178,7 +345,8 @@ pub fn open(path: &Path, det: &Detected, opts: &OpenOptions) -> anyhow::Result<B
         Container::Rpm => parse_rpm(&data)?,
         Container::Cpio => parse_cpio(&data)?,
         Container::Iso => parse_iso(&data)?,
-        // 单流压缩:先整体解压(限额),再判定是 tar 复合还是单条目
+        // 单流压缩:只 peek 解压头部 512B 判定 tar 复合;单条目改为读时流式解压
+        // (read_current_to 分块推进度条,大文件不再开档即全量驻留内存)。
         Container::LzmaAlone | Container::Lzip | Container::Lz4 | Container::Gz => {
             let comp = match container {
                 Container::LzmaAlone => Comp::LzmaAlone,
@@ -187,8 +355,8 @@ pub fn open(path: &Path, det: &Detected, opts: &OpenOptions) -> anyhow::Result<B
                 _ => Comp::Gzip,
             };
             let cap = opts.max_entry_size.unwrap_or(u64::MAX);
-            let bytes = decompress(comp, &data, cap)?;
-            if looks_tar(&bytes) {
+            if looks_tar(&decompress_head(comp, &data)) {
+                let bytes = decompress(comp, &data, cap)?;
                 plan_tar(&bytes)?
             } else {
                 let name = opts
@@ -200,14 +368,15 @@ pub fn open(path: &Path, det: &Detected, opts: &OpenOptions) -> anyhow::Result<B
                     Entry {
                         name,
                         kind: EntryKind::File,
-                        size: bytes.len() as u64,
+                        // 头部/尾部估算(gz ISIZE 等);未知为 0(进度条退化为无总长模式)
+                        size: stream_total(comp, &data).unwrap_or(0),
                         compressed_size: data.len() as u64,
                         method: comp_label(comp).into(),
                         mtime_epoch: None,
                         encrypted: false,
                         link_target: None,
                     },
-                    Fetch::Inline(bytes),
+                    Fetch::Comp { off: 0, len: data.len() as u64, comp },
                 )]
             }
         }
@@ -1167,6 +1336,87 @@ mod tests {
         h[257..262].copy_from_slice(b"ustar");
         // 头和字段清零 → 校验和必然不符
         assert!(!looks_tar(&h));
+    }
+
+    #[test]
+    fn stream_total_gzip_isize() {
+        // 构造 gzip:头部 10B + 尾部 ISIZE(u32 LE)。ISIZE = 0x3c00000
+        let mut data = vec![0x1f, 0x8b, 0, 0, 0, 0, 0, 0, 0, 0];
+        data.extend_from_slice(&[0, 0, 0, 0]); // CRC32
+        data.extend_from_slice(&0x03c0_0000u32.to_le_bytes()); // ISIZE
+        assert_eq!(stream_total(Comp::Gzip, &data), Some(0x03c0_0000));
+    }
+
+    #[test]
+    fn stream_total_lzma_alone() {
+        // props(1) + dict(4) + size(8)
+        let mut data = vec![0x5d, 0x00, 0x00, 0x80, 0x00];
+        data.extend_from_slice(&62914560u64.to_le_bytes()); // known size
+        data.extend_from_slice(&[0, 0, 0, 0]); // rest
+        assert_eq!(stream_total(Comp::LzmaAlone, &data), Some(62914560));
+        // unknown size(全 1)→ None
+        let mut unk = vec![0x5d, 0x00, 0x00, 0x80, 0x00];
+        unk.extend_from_slice(&u64::MAX.to_le_bytes());
+        unk.extend_from_slice(&[0, 0, 0, 0]);
+        assert_eq!(stream_total(Comp::LzmaAlone, &unk), None);
+    }
+
+    #[test]
+    fn stream_total_lz4_frame() {
+        // magic(4) FLG(1,含 content-size bit3)BD(1) CSIZE(8)
+        let mut data = vec![0x04, 0x22, 0x4d, 0x18, 0b0000_1000, 0x40];
+        data.extend_from_slice(&123456u64.to_le_bytes());
+        data.extend_from_slice(&[0, 0, 0, 0]);
+        assert_eq!(stream_total(Comp::Lz4, &data), Some(123456));
+    }
+
+    /// 懒式流单文件路径:is_single_file/估算总长/read_current_to 与整读字节一致。
+    #[test]
+    fn lazy_gz_stream_matches_read_current() {
+        use crate::detect::{Container, Detected, Known};
+        let payload: Vec<u8> = (0..200_000u32).flat_map(|i| (i * 7919).to_le_bytes()).collect();
+        let mut gz = Vec::new();
+        {
+            let mut enc = flate2::write::GzEncoder::new(&mut gz, flate2::Compression::default());
+            std::io::Write::write_all(&mut enc, &payload).unwrap();
+            enc.finish().unwrap();
+        }
+        let path = std::env::temp_dir().join(format!("anyarc_lazy_{}.gz", std::process::id()));
+        std::fs::write(&path, &gz).unwrap();
+
+        let det = Detected { kind: Known::Container(Container::Gz), prefix_bytes: 0 };
+        let mut ar = open(&path, &det, &crate::backend::OpenOptions::default()).unwrap();
+        assert!(ar.is_single_file(), "单流 gz 应判定为单文件作业");
+        let entry = ar.next_entry().unwrap().unwrap();
+        assert_eq!(entry.size, payload.len() as u64, "总长估算 = ISIZE(单成员精确)");
+        let mut sink = Vec::new();
+        let n = ar.read_current_to(&mut sink).unwrap();
+        assert_eq!(n as usize, payload.len());
+        assert_eq!(sink, payload);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// 空 gzip(ISIZE=0):无总长模式,read_current_to 返回 0 且不 panic。
+    #[test]
+    fn lazy_gz_empty_stream() {
+        use crate::detect::{Container, Detected, Known};
+        let path = std::env::temp_dir().join(format!("anyarc_empty_{}.gz", std::process::id()));
+        let mut gz = Vec::new();
+        {
+            let mut enc = flate2::write::GzEncoder::new(&mut gz, flate2::Compression::default());
+            std::io::Write::write_all(&mut enc, b"").unwrap();
+            enc.finish().unwrap();
+        }
+        std::fs::write(&path, &gz).unwrap();
+        let det = Detected { kind: Known::Container(Container::Gz), prefix_bytes: 0 };
+        let mut ar = open(&path, &det, &crate::backend::OpenOptions::default()).unwrap();
+        assert!(ar.is_single_file());
+        let entry = ar.next_entry().unwrap().unwrap();
+        assert_eq!(entry.size, 0); // 空流 ISIZE=0 → 无总长模式
+        let mut sink = Vec::new();
+        let n = ar.read_current_to(&mut sink).unwrap();
+        assert_eq!(n, 0);
+        let _ = std::fs::remove_file(&path);
     }
 }
 

@@ -10,6 +10,11 @@
   与 GNU shorten/flac 产物字节级对拍一致
 - M4-b 进度条:extract/test/create/repack 接入 indicatif(TTY 自动启用,
   `-q`/非 TTY 关闭;stderr 输出,stdout/`--json` 不受影响)
+- M4-b+ pv 风格单文件进度条:单流解压后端新增流式接口 `read_current_to`,
+  自写容器(gz/lzma/lzip/lz4)改为读时惰性流式解压(开档不再全量驻留内存);
+  单文件作业显示 进度条/百分比/已解压字节/速率/ETA(总长按 gzip 尾 ISIZE、
+  LZMA 头尺寸域、lz4 帧头估算;未知或超出估算时自动降级为无总长模式);
+  多条目落盘进度改为人读字节+速率,unarc 后端经默认分块写平滑推进
 - M4 发布工程:
   - `anyarc completions <bash|zsh|fish|elvish|powershell>` 生成 shell 补全脚本
   - `anyarc man` 输出 roff man page(`anyarc man | man -l -`)
