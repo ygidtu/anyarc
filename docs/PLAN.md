@@ -166,6 +166,8 @@ pub struct Capabilities { read: bool, write: bool, password: bool, multi_volume:
 
 ```bash
 cd /home/zym/code/anyarc
-bash poc/ref_extract.sh            # 生成参照 manifest(需 7z/unar/tar/unzip/cabextract)
-cargo run --release                # 输出 130 行兼容性矩阵
+bash poc/ref_extract.sh                    # 生成参照 manifest(需 7z/unar/tar/unzip/cabextract)
+cargo build --release
+./target/release/matrix                    # 130 例兼容性矩阵(= poc/results.md 的生成器)
+python3 poc/fuzz_mutate.py [N]             # 字节翻转 fuzz(CRASH/TIMEOUT 应为 0)
 ```

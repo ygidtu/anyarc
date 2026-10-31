@@ -39,7 +39,7 @@ pub struct CommonArgs {
     #[arg(short = 'p', long)]
     pub password: Option<String>,
     /// 覆盖已存在文件(默认不覆盖并告警)
-    #[arg(short = 'o', long)]
+    #[arg(long)]
     pub overwrite: bool,
     /// 条目名编码修复(如 gbk):未标 UTF-8 的名字按 cp437→指定编码重解码
     #[arg(short = 'e', long)]
@@ -67,7 +67,7 @@ pub struct ExtractArgs {
     #[command(flatten)]
     pub common: CommonArgs,
     /// 输出目录(默认当前目录)
-    #[arg(short = 'O', long, default_value = ".")]
+    #[arg(short = 'o', long, default_value = ".")]
     pub out: PathBuf,
 }
 
@@ -99,9 +99,9 @@ fn detect_with_warning(path: &Path, quiet: bool) -> anyhow::Result<Detected> {
     if let Known::Unarc(_) = det.kind {
         if det.prefix_bytes > 0 && !quiet {
             eprintln!(
-                "警告: {} 检测到 {} 字节前置数据(疑似 SFX/伪装档),条目偏移已自动修正",
-                path.display(),
-                det.prefix_bytes
+                "检测到 {} 字节前置数据(疑似伪装/SFX),条目名偏移已自动修正: {}",
+                det.prefix_bytes,
+                path.display()
             );
         }
     }
