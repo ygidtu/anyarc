@@ -130,9 +130,17 @@ pub struct WriteEntry {
     pub mtime: Option<u64>, // unix epoch 秒
 }
 
-/// 展开磁盘输入为内存条目(目录递归)。归档根 = 输入目录 basename(tar/7z 惯例)。
-fn plan_entries(inputs: &[PathBuf]) -> anyhow::Result<Vec<WriteEntry>> {
+/// 兼容旧接口:规划 + 无进度读取(单测/内部使用)。
+pub fn plan_entries(inputs: &[PathBuf]) -> anyhow::Result<Vec<WriteEntry>> {
+    let (mut entries, mapping) = plan_entries_with_map(inputs)?;
+    read_file_entries(&mut entries, &mapping, false)?;
+    Ok(entries)
+}
+
+/// 规划阶段:条目骨架 + name→磁盘路径 mapping(普通文件数据延迟到二段读)。
+fn plan_entries_with_map(inputs: &[PathBuf]) -> anyhow::Result<(Vec<WriteEntry>, Vec<Option<PathBuf>>)> {
     let mut out = Vec::new();
+    let mut map: Vec<Option<PathBuf>> = Vec::new();
     for p in inputs {
         let meta = std::fs::symlink_metadata(p)
             .map_err(|_| anyhow::anyhow!("输入不存在:{}", p.display()))?;
@@ -150,47 +158,79 @@ fn plan_entries(inputs: &[PathBuf]) -> anyhow::Result<Vec<WriteEntry>> {
                     let rel = format!("{root}/{}", arc_name(&base, &epath));
                     if em.is_dir() {
                         stack.push(epath.clone());
-                        out.push(make_entry(&epath, &em, rel + "/"));
+                        out.push(make_entry(&epath, &em, rel + "/").0);
+                        map.push(None);
                     } else if em.is_file() || em.is_symlink() {
-                        out.push(make_entry(&epath, &em, rel));
+                        let (e2, src) = make_entry(&epath, &em, rel);
+                        out.push(e2);
+                        map.push(src);
                     }
                 }
             }
-            out.push(make_entry(p, &meta, format!("{root}/")));
+            out.push(make_entry(p, &meta, format!("{root}/")).0);
+            map.push(None);
         } else if meta.is_file() || meta.is_symlink() {
             let name = p
                 .file_name()
                 .map(|s| s.to_string_lossy().into_owned())
                 .unwrap_or_default();
-            out.push(make_entry(p, &meta, name));
+            let (e2, src) = make_entry(p, &meta, name);
+            out.push(e2);
+            map.push(src);
         } else {
             bail!("输入不是普通文件/目录/符号链接:{}", p.display());
         }
     }
-    out.sort_by(|a, b| a.name.cmp(&b.name));
-    out.dedup_by(|a, b| a.name == b.name);
-    Ok(out)
+    let mut paired: Vec<(WriteEntry, Option<PathBuf>)> = out.into_iter().zip(map).collect();
+    paired.sort_by(|a, b| a.0.name.cmp(&b.0.name));
+    paired.dedup_by(|a, b| a.0.name == b.0.name);
+    let (entries, mapping): (Vec<_>, Vec<_>) = paired.into_iter().unzip();
+    Ok((entries, mapping))
 }
 
-fn make_entry(path: &Path, meta: &std::fs::Metadata, name: String) -> WriteEntry {
+/// 二段式读:填充 File 条目内容;条目多且 TTY 且未 -q 时画进度条。
+fn read_file_entries(
+    entries: &mut [WriteEntry],
+    mapping: &[Option<PathBuf>],
+    progress: bool,
+) -> anyhow::Result<()> {
+    let n_src = mapping.iter().filter(|m| m.is_some()).count();
+    let bar = crate::progress::EntryBar::new(progress && crate::extract::is_tty() && n_src > 8, "读取");
+    for (e, src) in entries.iter_mut().zip(mapping) {
+        if let (WriteKind::File(data), Some(path)) = (&mut e.kind, src) {
+            bar.message(e.name.clone());
+            *data = std::fs::read(path).unwrap_or_default();
+            bar.inc();
+        }
+    }
+    bar.finish();
+    Ok(())
+}
+
+/// 返回 (条目骨架, 待读磁盘路径);普通文件数据延迟(Option::Some),
+/// 目录/symlink 即时完成(None;symlink 目标是短字符串,无需进度)。
+fn make_entry(path: &Path, meta: &std::fs::Metadata, name: String) -> (WriteEntry, Option<PathBuf>) {
     let mode = perm_mode(&meta.permissions());
     let mtime = meta
         .modified()
         .ok()
         .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
         .map(|d| d.as_secs());
-    let kind = if name.ends_with('/') {
-        WriteKind::Dir
+    let (kind, src) = if name.ends_with('/') {
+        (WriteKind::Dir, None)
     } else if meta.is_symlink() {
-        WriteKind::Symlink(
-            std::fs::read_link(path)
-                .map(|t| t.to_string_lossy().into_owned())
-                .unwrap_or_default(),
+        (
+            WriteKind::Symlink(
+                std::fs::read_link(path)
+                    .map(|t| t.to_string_lossy().into_owned())
+                    .unwrap_or_default(),
+            ),
+            None,
         )
     } else {
-        WriteKind::File(std::fs::read(path).unwrap_or_default())
+        (WriteKind::File(Vec::new()), Some(path.to_path_buf()))
     };
-    WriteEntry { name, kind, mode, mtime }
+    (WriteEntry { name, kind, mode, mtime }, src)
 }
 
 fn arc_name(base: &Path, f: &Path) -> String {
@@ -216,11 +256,14 @@ pub struct CreateOptions<'a> {
     pub inputs: &'a [PathBuf],
     pub password: Option<&'a str>,
     pub overwrite: bool,
+    /// TTY 读文件阶段进度(-q 关闭;非 TTY 自动无操作)
+    pub progress: bool,
 }
 
 pub fn create(opts: &CreateOptions) -> anyhow::Result<u64> {
     let fmt = CreateFormat::from_out(opts.out)?;
-    let entries = plan_entries(opts.inputs)?;
+    let (mut entries, mapping) = plan_entries_with_map(opts.inputs)?;
+    read_file_entries(&mut entries, &mapping, opts.progress)?;
     write_archive(fmt, opts.out, &entries, opts.password, opts.overwrite)
 }
 
@@ -533,6 +576,8 @@ pub struct RepackOptions<'a> {
     /// 目标加密密码(仅 zip AES;与源密码分离,避免意外加密产物)
     pub write_password: Option<&'a str>,
     pub overwrite: bool,
+    /// TTY 读源条目阶段进度(-q 关闭;非 TTY 自动无操作)
+    pub progress: bool,
 }
 
 /// 读 `src`(L1–L3 全格式)→ 按 `dst` 扩展名走 create 白名单。
@@ -550,8 +595,13 @@ pub fn repack(opts: &RepackOptions) -> anyhow::Result<u64> {
         ..Default::default()
     };
     let mut ar = crate::backend::open(opts.src, &det, &open_opts)?;
+    let bar = crate::progress::EntryBar::new(
+        opts.progress && crate::extract::is_tty(),
+        "读取源",
+    );
     let mut entries = Vec::new();
     while let Some(e) = ar.next_entry()? {
+        bar.message(e.name.clone());
         // File 分支的 read_current 会消费条目;其余必须显式 skip 才能前进
         let consumed = matches!(e.kind, crate::backend::EntryKind::File);
         let kind = match e.kind {
@@ -578,10 +628,12 @@ pub fn repack(opts: &RepackOptions) -> anyhow::Result<u64> {
             }
         };
         entries.push(WriteEntry { name: e.name, kind, mode: 0o644, mtime: e.mtime_epoch });
+        bar.inc();
         if !consumed {
             ar.skip_current()?;
         }
     }
+    bar.finish();
     // 单流源解压出的条目若为 tar(复合已被展开)则条目名保留树形;
     // 单条目 tar→单流 反向打包时对齐命名(去掉解压产生的扩展名)
     if fmt.is_single() && entries.len() == 1 && matches!(entries[0].kind, WriteKind::File(_)) {

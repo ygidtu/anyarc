@@ -360,13 +360,11 @@ fn extract_one(
     let mut n_dir = 0usize;
     let mut n_skipped = 0usize;
     let mut n_overwrite_skip = 0usize;
-    let show_progress = crate::extract::is_tty() && !args.common.quiet;
-    let mut seq = 0usize;
+    let mut bar = crate::progress::ExtractBar::new(crate::extract::is_tty() && !args.common.quiet);
     // 捐赠者尚未出现的硬链接(pass 2 处理;cpio 允许 dup 排在数据条目之前)
     let mut deferred_links: Vec<(std::path::PathBuf, String)> = Vec::new();
 
     while let Some(entry) = ar.next_entry()? {
-        seq += 1;
         let name = fixed_name(&entry.name, enc);
         match entry.kind {
             EntryKind::Directory => {
@@ -391,14 +389,13 @@ fn extract_one(
                     ar.skip_current()?;
                     continue;
                 }
-                if show_progress {
-                    eprint!("\r解压 [{seq}]: {name}");
-                }
+                bar.entry(&name);
                 let data = ar.read_current()?; // 读后条目已消费
                 if let Some(parent) = p.parent() {
                     std::fs::create_dir_all(parent)?;
                 }
                 std::fs::write(&p, &data)?;
+                bar.add_bytes(data.len());
                 n_file += 1;
             }
             EntryKind::Symlink => {
@@ -469,11 +466,13 @@ fn extract_one(
                     ar.skip_current()?;
                 } else {
                     // 降级路径:读内容写普通文件(保持可读性优先)
+                    bar.entry(&name);
                     let data = ar.read_current()?;
                     if let Some(parent) = p.parent() {
                         std::fs::create_dir_all(parent)?;
                     }
                     std::fs::write(&p, &data)?;
+                    bar.add_bytes(data.len());
                     n_file += 1;
                 }
             }
@@ -506,8 +505,9 @@ fn extract_one(
         std::fs::write(&p, b"")?;
         n_file += 1;
     }
-    if show_progress {
-        eprintln!("\r解压完成: {} 个文件, {} 个目录({})", n_file, n_dir, path.display());
+    bar.finish();
+    if !args.common.quiet && crate::extract::is_tty() {
+        eprintln!("解压完成: {} 个文件, {} 个目录({})", n_file, n_dir, path.display());
     }
     if n_skipped > 0 {
         eprintln!("警告: {} 个不安全/特殊条目已跳过(Zip-slip 防护)", n_skipped);
@@ -523,7 +523,7 @@ pub fn cmd_test(args: &TestArgs) -> anyhow::Result<u8> {
     for path in &args.common.archives {
         let det = detect_with_warning(path, args.common.quiet)?;
         let mut ar = open_verified(path, &det, &args.common)?;
-        match test_one(ar.as_mut()) {
+        match test_one(ar.as_mut(), !args.common.quiet) {
             Ok(files) => {
                 if !args.common.quiet {
                     println!("OK: {} ({files} 个条目全部解码+CRC校验通过)", path.display());
@@ -538,16 +538,20 @@ pub fn cmd_test(args: &TestArgs) -> anyhow::Result<u8> {
     Ok(if failures == 0 { 0 } else { 1 })
 }
 
-fn test_one(ar: &mut dyn ArchiveBackend) -> anyhow::Result<usize> {
+fn test_one(ar: &mut dyn ArchiveBackend, verbose: bool) -> anyhow::Result<usize> {
     let mut files = 0usize;
+    let bar = crate::progress::EntryBar::new(crate::extract::is_tty() && verbose, "测试");
     while let Some(e) = ar.next_entry()? {
         if e.kind == EntryKind::Directory {
             ar.skip_current()?;
             continue;
         }
+        bar.message(e.name.clone());
         ar.read_current()?;
+        bar.inc();
         files += 1;
     }
+    bar.finish();
     Ok(files)
 }
 
@@ -843,6 +847,7 @@ pub fn cmd_create(args: &CreateArgs) -> anyhow::Result<u8> {
         inputs,
         password,
         overwrite: args.overwrite,
+        progress: !args.quiet,
     })?;
     if !args.quiet {
         eprintln!("已创建 {}({} bytes)← {} 个输入条目", out.display(), n, inputs.len());
@@ -859,6 +864,7 @@ pub fn cmd_repack(args: &RepackArgs) -> anyhow::Result<u8> {
         password,
         write_password: args.encrypt.as_deref(),
         overwrite: args.overwrite,
+        progress: !args.quiet,
     })?;
     if !args.quiet {
         eprintln!("已重打包 {} → {}({} bytes)", args.src.display(), args.dst.display(), n);

@@ -179,6 +179,15 @@ pub struct Capabilities { read: bool, write: bool, password: bool, multi_volume:
 > 刷新;`dist build` 产物含 matrix 工具(cargo-dist 0.32 无法按 bin 过滤,publish=false/
 > required-features 均无效;合计 <12 MB 可接受,M4-b 或拆 examples 再议)。
 
+> **M4-b 进度条(2026-10-31)**:indicatif(纯 Rust,~100KB)接入 extract/test/
+> create/repack 四个耗时路径;`src/progress.rs` 提供 EntryBar/ExtractBar,
+> 构造顺序 new→set_style→set_prefix→tick(防默认样式 `{bar} {pos}/{len}` 闪现,
+> 曾出现 "0/18446744073709551615" 噪声帧);未知总数样式仅 spinner+pos。
+> 门控:stderr TTY && !quiet(非 TTY/`-q` 完全静默,stdout 与 --json 不受影响);
+> create 读取阶段二段式(plan_entries_with_map→read_file_entries,>8 条目才画)。
+> musl 产物 6.4 MB(验收不变);回归:单测 18 全绿、矩阵 81/25/0/24、e2e 105/26/2、
+> fuzz_mutate 3240 CRASH=0。genozip-rs(progress.rs 手写 ANSI 方案)整合评估见 §10。
+
 | L3 接 crate | lzma 单流(.lzma)、lzip(.lz)、lz4(.lz4) | lzma-rs(raw,MIT)+ lzma-rust2(LzipReader,Apache-2.0)+ lz4_flex(MIT);**bzip3 排除**(绑定 LGPL-3 C 库,转 Backlog) | **M2-b1 完成**(2026-10-31) |
 | L4 spec 重写 | udf、chm | 按公开规范纯 Rust 实现 | **Backlog 再议**(2026-10-30:需求弱,不排期)。2026-10-31:混合介质(ISO9660+UDF)已可按标准 AVDP(`BEA01VRS`@LBA256/512)与 genisoimage 内嵌指针(LBA18/19)识别,路由 Backlog 报错而非误走 ISO 解析) |
 | L5 音频容器 | flac(`claxon`)、ape(`ape-decoder`)、shn(自研 `src/shn.rs`) | crate 接入 + 自写位流解码,只读 | **M3-L5 完成**(2026-10-31,oracle 字节全等) |
@@ -224,7 +233,7 @@ pub struct Capabilities { read: bool, write: bool, password: bool, multi_volume:
 | **M1 骨架** | CLI + Backend trait + detect(含二跳修复)+ L1 全量 + 安全落盘 | PoC 矩阵 100% 绿(除已知 FAIL);`anyarc extract` 日常格式可用 | 2–3 周 |
 | **M2 容器补全** | L3 自写容器 + crate 接入;`create`/`test`/`list` 白名单 | fixture 全绿;deb/rpm/cpio 与 7z 对拍一致 | 2–3 周 |
 | **M3 收尾** | L5 音频只读;`repack`/`diff` | patool 高频格式对齐度 ~85%(加权;Backlog 项若再议通过则补排期) | 3–4 周 |
-| **M4 发布工程** | cargo-dist 多平台矩阵、man page、shell 补全、变更日志 | 单文件 ≤25 MB,`ldd` 无依赖 | **进行中**(M4-a 完成:补全/man/musl 静态/dist 矩阵;真实 CI 矩阵待 remote) |
+| **M4 发布工程** | cargo-dist 多平台矩阵、man page、shell 补全、变更日志、进度条 | 单文件 ≤25 MB,`ldd` 无依赖 | **进行中**(M4-a/b 完成:补全/man/musl 静态/dist 矩阵/indicatif 进度;真实 CI 矩阵待 remote) |
 | **M5 上游反哺** | unarc-rs PR(复合探测、FreeArc magic)、测试语料共享 | PR 合并 | 持续 |
 
 **Backlog(再议池,无排期)**:udf、chm、alz、freearc、zpaq、shar、wav、vhd、wim。

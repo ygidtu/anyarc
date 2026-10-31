@@ -30,6 +30,8 @@ anyarc man                           # roff man page:anyarc man | man -l -
 ```
 
 - 密码:`-p` / `ANYARC_PASSWORD` / tty 隐藏输入
+- 进度:extract/test/create/repack 在 TTY 下显示进度条(indicatif,写 stderr);
+  非 TTY 或 `-q` 自动关闭,stdout 与 `--json` 永不受影响
 - 安全落盘:路径逃逸拒绝、默认不覆盖、`--max-entry-size`(默认 4 GiB)/
   `--max-total-size`(默认 32 GiB)
 - 退出码:0 成功 / 1 运行时错误 / 2 用法错误

@@ -8,6 +8,8 @@
 - M3-L5 音频容器只读解码:FLAC(claxon)、Monkey's Audio 3.95+(ape-decoder)、
   Shorten v2/v3(自研 clean-room 解码器);输出统一为 `{stem}.wav`,
   与 GNU shorten/flac 产物字节级对拍一致
+- M4-b 进度条:extract/test/create/repack 接入 indicatif(TTY 自动启用,
+  `-q`/非 TTY 关闭;stderr 输出,stdout/`--json` 不受影响)
 - M4 发布工程:
   - `anyarc completions <bash|zsh|fish|elvish|powershell>` 生成 shell 补全脚本
   - `anyarc man` 输出 roff man page(`anyarc man | man -l -`)
