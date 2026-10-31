@@ -4,7 +4,7 @@ use std::fs::File;
 use std::io::{BufReader, Read, Seek};
 use std::path::{Path, PathBuf};
 
-use unarc_rs::unified::{ArchiveEntry, ArchiveFormat, ArchiveOptions, UnifiedArchive};
+use unarc_rs::unified::{ArchiveEntry, ArchiveFormat, ArchiveOptions, UnifiedArchive, VolumeProvider};
 
 use crate::backend::{ArchiveBackend, OpenOptions};
 use crate::detect::{Backlog, Detected, Known};
@@ -67,6 +67,53 @@ fn to_opts(opts: &OpenOptions) -> ArchiveOptions {
     o
 }
 
+/// 路径命名模式分卷提供器:后端按编号 1,2,… 请求后续卷,
+/// 找不到(返回 None)时若末卷未声明后继则按单卷正常结束。
+struct PatternVolumes {
+    dir: PathBuf,
+    stem: String,
+    kind: ArchiveFormat,
+}
+
+impl VolumeProvider for PatternVolumes {
+    fn open_volume(&self, number: u32) -> Option<Box<dyn std::io::Read + Send>> {
+        for cand in volume_candidates(&self.dir, &self.stem, self.kind, number) {
+            if let Ok(f) = File::open(&cand) {
+                return Some(Box::new(BufReader::new(f)));
+            }
+        }
+        None
+    }
+}
+
+/// 各格式的后续卷命名候选(number 从 1 起,1 = 第二个文件)。
+fn volume_candidates(dir: &Path, stem: &str, kind: ArchiveFormat, number: u32) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    match kind {
+        ArchiveFormat::Rar => {
+            // RAR5: name.part002.rar …(number 从 1 起,物理 part 号 = number+1)
+            out.push(dir.join(format!("{stem}.part{:03}.rar", number + 1)));
+            // RAR4: name.r00, name.r01 …(第二卷 = r00)
+            if number >= 1 {
+                out.push(dir.join(format!("{stem}.r{:02}", number - 1)));
+            }
+        }
+        ArchiveFormat::Arj => {
+            // ARJ: name.a01, name.a02 …
+            out.push(dir.join(format!("{stem}.a{number:02}")));
+        }
+        _ => {}
+    }
+    out
+}
+
+/// 去掉最后一个扩展名得到分卷 stem(.rar/.cbr/.arj → 公共名)。
+fn split_dir_stem(path: &Path) -> Option<(PathBuf, String)> {
+    let name = path.file_name()?.to_str()?;
+    let stem = name.rsplit_once('.').map(|(s, _)| s).unwrap_or(name);
+    Some((path.parent()?.to_path_buf(), stem.to_string()))
+}
+
 /// 打开入口:分卷自动聚合,Backlog 格式给出明确错误。
 pub fn open(path: &Path, det: &Detected, opts: &OpenOptions) -> anyhow::Result<Box<dyn ArchiveBackend>> {
     let kind = match det.kind {
@@ -112,7 +159,14 @@ pub fn open(path: &Path, det: &Detected, opts: &OpenOptions) -> anyhow::Result<B
     }
 
     let file = BufReader::new(File::open(path)?);
-    let mut a = UnifiedArchive::open_with_format_and_options(file, kind, to_opts(opts))
+    let mut o = to_opts(opts);
+    // RAR/ARJ:挂命名模式 provider(单卷不受影响,找不到后继即正常结束)
+    if matches!(kind, ArchiveFormat::Rar | ArchiveFormat::Arj) {
+        if let Some((dir, stem)) = split_dir_stem(path) {
+            o = o.with_volume_provider(PatternVolumes { dir, stem, kind });
+        }
+    }
+    let mut a = UnifiedArchive::open_with_format_and_options(file, kind, o)
         .map_err(|e| anyhow::anyhow!("{e}"))?;
     if let Some(n) = &opts.single_file_name {
         a.set_single_file_name(n.clone());
@@ -171,4 +225,34 @@ fn collect_zip_volumes(path: &Path) -> Option<Vec<PathBuf>> {
     }
     zparts.push(zip_final);
     Some(zparts)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+
+    #[test]
+    fn rar_volume_names() {
+        let d = Path::new("/x");
+        let c1 = volume_candidates(d, "t", ArchiveFormat::Rar, 1);
+        assert_eq!(c1[0], Path::new("/x/t.part002.rar"));
+        assert_eq!(c1[1], Path::new("/x/t.r00"));
+        let c2 = volume_candidates(d, "t", ArchiveFormat::Rar, 2);
+        assert_eq!(c2[1], Path::new("/x/t.r01"));
+    }
+
+    #[test]
+    fn arj_volume_names() {
+        let c = volume_candidates(Path::new("/x"), "t", ArchiveFormat::Arj, 1);
+        assert_eq!(c[0], Path::new("/x/t.a01"));
+    }
+
+    #[test]
+    fn stem_strip() {
+        let (_, s) = split_dir_stem(Path::new("/x/t.rar")).unwrap();
+        assert_eq!(s, "t");
+        let (_, s) = split_dir_stem(Path::new("/x/t.cb7.foo")).unwrap();
+        assert_eq!(s, "t.cb7");
+    }
 }
