@@ -186,7 +186,7 @@ pub struct Capabilities { read: bool, write: bool, password: bool, multi_volume:
 > 门控:stderr TTY && !quiet(非 TTY/`-q` 完全静默,stdout 与 --json 不受影响);
 > create 读取阶段二段式(plan_entries_with_map→read_file_entries,>8 条目才画)。
 > musl 产物 6.4 MB(验收不变);回归:单测 18 全绿、矩阵 81/25/0/24、e2e 105/26/2、
-> fuzz_mutate 3240 CRASH=0。genozip-rs(progress.rs 手写 ANSI 方案)整合评估见 §10。
+> fuzz_mutate 3240 CRASH=0。genozip-rs(progress.rs 手写 ANSI 方案)设计参考见 §10.1。
 
 | L3 接 crate | lzma 单流(.lzma)、lzip(.lz)、lz4(.lz4) | lzma-rs(raw,MIT)+ lzma-rust2(LzipReader,Apache-2.0)+ lz4_flex(MIT);**bzip3 排除**(绑定 LGPL-3 C 库,转 Backlog) | **M2-b1 完成**(2026-10-31) |
 | L4 spec 重写 | udf、chm | 按公开规范纯 Rust 实现 | **Backlog 再议**(2026-10-30:需求弱,不排期)。2026-10-31:混合介质(ISO9660+UDF)已可按标准 AVDP(`BEA01VRS`@LBA256/512)与 genisoimage 内嵌指针(LBA18/19)识别,路由 Backlog 报错而非误走 ISO 解析) |
@@ -257,28 +257,7 @@ pub struct Capabilities { read: bool, write: bool, password: bool, multi_volume:
 4. udf/chm 排期 → 同上,**转 Backlog 再议**,M3 因此瘦身至 3–4 周;
 5. crates.io 占位 → **不需要**(自用项目)。
 
-### 10.1 genozip-rs 整合评估(2026-10-31,项目位于 /mnt/data1/zhang/projects/genozip/genozip-rs)
-
-**结论:可整合,建议以“可选 feature + 库依赖”方式接入,不合并代码树。**
-
-- 契合点:MIT 许可、原创 `.grz` 容器(无 GPL/专利代码污染红线)、纯 Rust 为主、
-  库 API 与 anyarc `ArchiveBackend` 单条目语义几乎一一对应:
-  `info()→Entry{name=orig_name,size=original_size}`、`decompress()→read_current`、
-  `verify()→test`;detect 加 `GRNZ` 魔数 + `.grz` 扩展名即可路由。
-- 代价/风险:
-  1. 依赖增量:brotli、rayon、libdeflater(C)、crc32fast、xxhash、tracing 全家桶
-     (anyarc 目前无 tracing;可接受但需裁剪——建议 feature 化,默认发布二进制不含);
-  2. `.grz` 格式未定版(v2,paired/embed_ref 演进中)→ anyarc 验收基线会随对方变动;
-     patool 无基因组格式,矩阵语义=自造 fixture 对拍(对方 roundtrip/proptest 已具备);
-  3. 语义差:genozip CLI 对文本默认解压输出 **gzip**(`-p` 才纯文本),anyarc extract
-     应输出“原始文件字节”(即 decompress 的字节级往返目标),需明确条目名与内容约定
-     (orig_name 如 x.vcf.gz → 解出 x.vcf.gz,而非再套 gzip);
-  4. lz4_flex 0.11 vs 0.14、edition 2021 vs 2024:path 依赖可共存(双版本编译),但版本漂移要盯。
-- 建议路径:M4+ 之后做 `anyarc --features genomics`,新增 `src/backend/genozip.rs`
-  薄适配层(≈150 行);同时其 `progress.rs` 设计(TTY 自动降级、CJK 列宽、
-  刷新节流)已借鉴进 our `src/progress.rs` 门控思路,无需引入其代码。
-
-### 10.2 genozip-rs vs quip 对比实测(2026-10-31,quip=/home/zym/software/quip,dcjones/quip 1.1.8,BSD)
+### 10.1 genozip-rs 与 quip 对比评估(2026-10-31,quip=/home/zym/software/quip,dcjones/quip 1.1.8,BSD)
 
 **代码逻辑两条技术路线**:
 - quip:自适应高阶 Markov(seqenc.c order-11 + 前缀位置模型;qualenc.c 三进制分箱
@@ -310,10 +289,9 @@ quip CPU 占用 ~1.6 核,genozip-rs rayon 并行 4–26 核)。
 **压缩率结论:quip 明显更好**(质量流高阶自适应模型对真实测序数据优势 2x 上下;
 恒定 Q 场景也赢;reference/assembly 模式还有额外一大截潜力)。
 
-**对 anyarc 的含义**:整合候选仍是 genozip-rs(库 API 对应单条目后端、feature 化
-依赖可控)。quip 不建议整合(无库接口、停更 C 代码、运行时 zlib/bz2 依赖违背
-零系统依赖红线);其价值是"格式识别 + 明确报错指引"即可(detect 加 `FF 51 55 49 50 00`
-magic → 提示用 quip),列 Backlog M5+。
+**与 anyarc 的关系**:不做整合,亦无相关规划;本节仅为外部项目技术对比存档。
+quip 格式 `.qp` 对 anyarc 的价值止于"格式识别 + 明确报错指引"(detect 加
+`FF 51 55 49 50 00` magic → 提示使用 quip 本体),列 Backlog M5+。
 
 ## 11. 快速复现 PoC
 
