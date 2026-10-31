@@ -11,6 +11,8 @@ fn main() {
         anyarc::cli::Cmd::Search(a) => run(anyarc::cli::cmd_search(&a)),
         anyarc::cli::Cmd::Repack(a) => run(anyarc::cli::cmd_repack(&a)),
         anyarc::cli::Cmd::Formats => run(anyarc::cli::cmd_formats()),
+        anyarc::cli::Cmd::Completions(a) => run(anyarc::cli::write_completions(a.shell).map(|()| 0)),
+        anyarc::cli::Cmd::Man => run(anyarc::cli::write_man().map(|()| 0)),
     };
     std::process::exit(code);
 }

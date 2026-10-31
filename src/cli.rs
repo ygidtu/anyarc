@@ -1,4 +1,4 @@
-use std::io::IsTerminal;
+use std::io::{IsTerminal, Write as _};
 use std::path::{Path, PathBuf};
 
 use clap::Parser;
@@ -35,6 +35,17 @@ pub enum Cmd {
     Repack(RepackArgs),
     /// 打印格式支持表
     Formats,
+    /// 生成 shell 补全脚本(bash/zsh/fish/elvish/powershell)
+    Completions(CompletionsArgs),
+    /// 输出 man page(roff,可 `anyarc man | man -l -`)
+    Man,
+}
+
+#[derive(clap::Args, Debug)]
+pub struct CompletionsArgs {
+    /// 目标 shell
+    #[arg(value_enum)]
+    pub shell: clap_complete::Shell,
 }
 
 #[derive(clap::Args, Debug)]
@@ -855,8 +866,52 @@ pub fn cmd_repack(args: &RepackArgs) -> anyhow::Result<u8> {
     Ok(0)
 }
 
-pub fn cmd_formats() -> anyhow::Result<u8> {
-    // 与 detect 的兜底/黑名单保持一致的能力表
+/// 生成 shell 补全脚本到 stdout(anyarc completions <shell>)。
+pub fn write_completions(shell: clap_complete::Shell) -> anyhow::Result<()> {
+    let mut cmd = <Cli as clap::CommandFactory>::command();
+    let bin = cmd.get_name().to_string();
+    // BrokenPipe(如 | head)不是错误:按约定忽略(与 GNU coreutils 一致);
+    // 其余写错误(如 ENOSPC)经 Stdout 内部缓冲难以逐次捕获,接受忽略。
+    let mut out = PipeTolerant(std::io::stdout());
+    clap_complete::generate(shell, &mut cmd, bin, &mut out);
+    out.0.flush().ok();
+    Ok(())
+}
+
+/// 生成 man page(roff)到 stdout(anyarc man | man -l -)。
+pub fn write_man() -> anyhow::Result<()> {
+    let cmd = <Cli as clap::CommandFactory>::command();
+    let man = clap_mangen::Man::new(cmd);
+    let mut out = PipeTolerant(std::io::stdout());
+    match man.render(&mut out) {
+        Ok(()) => {}
+        // render 内部可能仍透传 BrokenPipe(管道提前关闭),视为正常结束
+        Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => {}
+        Err(e) => return Err(anyhow::anyhow!("man 生成失败: {e}")),
+    }
+    out.0.flush().ok();
+    Ok(())
+}
+
+/// stdout 包装:吞掉 BrokenPipe(下游管道提前关闭),其余错误原样透传。
+struct PipeTolerant(std::io::Stdout);
+
+impl std::io::Write for PipeTolerant {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        match self.0.write(buf) {
+            Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => Ok(buf.len()),
+            r => r,
+        }
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        match self.0.flush() {
+            Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => Ok(()),
+            r => r,
+        }
+    }
+}
+
+pub fn cmd_formats() -> anyhow::Result<u8> {    // 与 detect 的兜底/黑名单保持一致的能力表
     const ROWS: &[(&str, &str, &str)] = &[
         ("zip jar apk epub cbz xpi odt", "read", "含前置数据 zip(SFX/polyglot)、分卷 .z01、WinZip AES-99、ZipCrypto"),
         ("rar cbr", "read", "RAR4/RAR5;含密码;分卷 .rNN/.partNNN 自动聚合"),

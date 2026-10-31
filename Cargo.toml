@@ -2,6 +2,10 @@
 name = "anyarc"
 version = "0.1.0"
 edition = "2024"
+description = "Universal archive tool: extract/test/list/create, zero external dependencies"
+license = "MIT OR Apache-2.0"
+# TODO:发布前改为真实仓库地址(当前无 remote;dist 需要一个规范 URL)
+repository = "https://github.com/TODO/anyarc"
 
 [lib]
 name = "anyarc"
@@ -14,6 +18,18 @@ path = "src/main.rs"
 [[bin]]
 name = "matrix"
 path = "src/bin/matrix.rs"
+
+# 发布配置:单文件静态二进制(≤25 MB 验收),LTO + 去调试符号
+[profile.release]
+lto = "fat"
+codegen-units = 1
+strip = "symbols"
+panic = "abort"
+
+# The profile that 'dist' will build with
+[profile.dist]
+inherits = "release"
+lto = "thin"
 
 [dependencies]
 sevenz-rust2 = "0.24.1"
@@ -33,6 +49,8 @@ tar = "0.4.46"
 lzma-rust2 = "0.24.0"
 claxon = "0.4.3"
 ape-decoder = "0.3.2"
+clap_complete = "4.6.11"
+clap_mangen = "0.3.3"
 
 # matrix(验收工具)需要;主二进制不用
 [dev-dependencies]

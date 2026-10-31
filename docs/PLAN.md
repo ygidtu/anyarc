@@ -162,6 +162,23 @@ pub struct Capabilities { read: bool, write: bool, password: bool, multi_volume:
 > 列入 M5 upstream 报告素材)。fuzz_mutate 增 t.flac/t.ape/t.shn 与 fuzz_headers 增
 > 音频头区复跑:mutate 10800(N=200×54)+ headers 36918,CRASH=0 / TIMEOUT=0。
 
+> **M4-a 发布工程(2026-10-31)**:
+> ① `anyarc completions <bash|zsh|fish|elvish|powershell>`(clap_complete)+ `anyarc man`
+> (clap_mangen,roff → `anyarc man | man -l -`),零外部依赖不变;两者对 BrokenPipe
+> (`| head`)静默容忍(panic=abort 下必须);
+> ② release profile 调优(lto=fat/codegen-units=1/strip/panic=abort)→ gnu 6.2 MB、
+> musl 6.3 MB(验收 ≤25 MB);x86_64-unknown-linux-musl **static-pie,ldd 无依赖**,
+> 矩阵/ e2e/ fuzz(headers 36918 + mutate 2160)在新 profile 下回归全绿(CRASH=0);
+> ③ cargo-dist 0.32(`dist init/generate/plan/build/linkage`):`dist-workspace.toml`
+> 七目标矩阵(gnu/musl × x86_64/aarch64 + win-msvc + macOS 双架构)+ shell/powershell
+> 安装器 + CHANGELOG include;本地 `dist build --target x86_64-unknown-linux-musl`
+> 产物 2.5 MB(xz),解包 anyarc 直接跑 matrix 130 例 = 81/25/0/24 一致;
+> ④ README 重写 + CHANGELOG.md 新建。
+> 待办:仓库无 GitHub remote → `release.yml` 已生成但 CI 真机矩阵(Windows/macOS/
+> aarch64 交叉)未验证;`Cargo.toml` repository=TODO 占位,换真实地址后 `dist generate`
+> 刷新;`dist build` 产物含 matrix 工具(cargo-dist 0.32 无法按 bin 过滤,publish=false/
+> required-features 均无效;合计 <12 MB 可接受,M4-b 或拆 examples 再议)。
+
 | L3 接 crate | lzma 单流(.lzma)、lzip(.lz)、lz4(.lz4) | lzma-rs(raw,MIT)+ lzma-rust2(LzipReader,Apache-2.0)+ lz4_flex(MIT);**bzip3 排除**(绑定 LGPL-3 C 库,转 Backlog) | **M2-b1 完成**(2026-10-31) |
 | L4 spec 重写 | udf、chm | 按公开规范纯 Rust 实现 | **Backlog 再议**(2026-10-30:需求弱,不排期)。2026-10-31:混合介质(ISO9660+UDF)已可按标准 AVDP(`BEA01VRS`@LBA256/512)与 genisoimage 内嵌指针(LBA18/19)识别,路由 Backlog 报错而非误走 ISO 解析) |
 | L5 音频容器 | flac(`claxon`)、ape(`ape-decoder`)、shn(自研 `src/shn.rs`) | crate 接入 + 自写位流解码,只读 | **M3-L5 完成**(2026-10-31,oracle 字节全等) |
@@ -207,7 +224,7 @@ pub struct Capabilities { read: bool, write: bool, password: bool, multi_volume:
 | **M1 骨架** | CLI + Backend trait + detect(含二跳修复)+ L1 全量 + 安全落盘 | PoC 矩阵 100% 绿(除已知 FAIL);`anyarc extract` 日常格式可用 | 2–3 周 |
 | **M2 容器补全** | L3 自写容器 + crate 接入;`create`/`test`/`list` 白名单 | fixture 全绿;deb/rpm/cpio 与 7z 对拍一致 | 2–3 周 |
 | **M3 收尾** | L5 音频只读;`repack`/`diff` | patool 高频格式对齐度 ~85%(加权;Backlog 项若再议通过则补排期) | 3–4 周 |
-| **M4 发布工程** | cargo-dist 多平台矩阵、man page、shell 补全、变更日志 | 单文件 ≤25 MB,`ldd` 无依赖 | 1 周 |
+| **M4 发布工程** | cargo-dist 多平台矩阵、man page、shell 补全、变更日志 | 单文件 ≤25 MB,`ldd` 无依赖 | **进行中**(M4-a 完成:补全/man/musl 静态/dist 矩阵;真实 CI 矩阵待 remote) |
 | **M5 上游反哺** | unarc-rs PR(复合探测、FreeArc magic)、测试语料共享 | PR 合并 | 持续 |
 
 **Backlog(再议池,无排期)**:udf、chm、alz、freearc、zpaq、shar、wav、vhd、wim。

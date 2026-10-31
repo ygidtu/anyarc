@@ -1,0 +1,28 @@
+[workspace]
+members = ["cargo:."]
+
+# Config for 'dist'(cargo-dist 0.32.0)
+# 注:ci/hosting=github 已启用;推送远端后打 tag 即触发 release.yml。
+# 仓库地址在 Cargo.toml 的 repository(TODO 占位,换真实地址后 `dist generate` 刷新)。
+[dist]
+# The preferred dist version to use in CI (Cargo.toml SemVer syntax)
+cargo-dist-version = "0.32.0"
+# CI backends to support
+ci = "github"
+# Where to host releases
+hosting = ["github"]
+# The installers to generate for each app
+installers = ["shell", "powershell"]
+# Target platforms to build apps for (Rust target-triple syntax)
+targets = [
+    "aarch64-apple-darwin",
+    "aarch64-unknown-linux-gnu",
+    "aarch64-unknown-linux-musl",
+    "x86_64-apple-darwin",
+    "x86_64-pc-windows-msvc",
+    "x86_64-unknown-linux-gnu",
+    "x86_64-unknown-linux-musl",
+]
+# 静态 musl 为主发布物:全静态、ldd 无依赖
+compress-type = "xztar"
+include = ["CHANGELOG.md", "README.md"]
