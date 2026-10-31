@@ -56,6 +56,12 @@ pub enum Container {
     Lz4,
     /// gzip 单流(自写 MultiGzDecoder:unarc 只解第一个成员,多成员语义不符)
     Gz,
+    /// FLAC 音频(解码为 WAV 单条目;claxon)
+    Flac,
+    /// Monkey's Audio(≥3.95;解码为 WAV;ape-decoder)
+    Ape,
+    /// Shorten v2/v3(解码为 WAV;oxideav-shorten)
+    Shn,
 }
 
 /// 探测结果。`prefix_bytes` 仅对 Zip 有意义:zip 体前的junk 数据长度
@@ -115,6 +121,16 @@ pub fn detect(path: &Path) -> std::io::Result<Option<Detected>> {
     }
     if head.starts_with(&[0x04, 0x22, 0x4D, 0x18]) {
         return Ok(Some(Detected { kind: Known::Container(Container::Lz4), prefix_bytes: 0 }));
+    }
+    // L5 音频容器(magic 可靠:4 字节 ASCII;ape/shn 的兼容性检查在解码侧给清晰错误)
+    if head.starts_with(b"fLaC") {
+        return Ok(Some(Detected { kind: Known::Container(Container::Flac), prefix_bytes: 0 }));
+    }
+    if head.starts_with(b"MAC ") {
+        return Ok(Some(Detected { kind: Known::Container(Container::Ape), prefix_bytes: 0 }));
+    }
+    if head.starts_with(b"ajkg") {
+        return Ok(Some(Detected { kind: Known::Container(Container::Shn), prefix_bytes: 0 }));
     }
     let len = file.seek(SeekFrom::End(0))?;
     if len >= 32774 {
@@ -213,6 +229,10 @@ fn ext_hint(path: &Path) -> Option<Known> {
         "lzma" => Known::Container(Container::LzmaAlone),
         "lz" => Known::Container(Container::Lzip),
         "lz4" => Known::Container(Container::Lz4),
+        // L5 音频(magic 之外的兜底;ape <3.95 / shn v1 由解码侧清晰报错)
+        "flac" => Known::Container(Container::Flac),
+        "ape" => Known::Container(Container::Ape),
+        "shn" => Known::Container(Container::Shn),
         // 自写容器(M2)
         "cpio" => Known::Container(Container::Cpio),
         "iso" => Known::Container(Container::Iso),

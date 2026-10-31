@@ -22,6 +22,10 @@ TARGETS = {
     "t.txt.lz":   [(0, 16), (30, 38)],
     "t.txt.lz4":  [(0, 7), (7, 15)],
     "t.txt.gz":   [(0, 10)],
+    # L5 音频:flac STREAMINFO/帧头、ape descriptor/header magic、shn 自研位流头+命令区
+    "t.flac": [(0, 60)],
+    "t.ape":  [(0, 64)],
+    "t.shn":  [(0, 120)],
 }
 VALUES = [0x00, 0x01, 0x02, 0x34, 0x41, 0x7F, 0x80, 0xC7, 0xFF]
 TIMEOUT = 10

@@ -146,9 +146,25 @@ pub struct Capabilities { read: bool, write: bool, password: bool, multi_volume:
 > 防 `-e` 误伤已正确的 UTF-8 名。单测 +2(encoding 守卫/glob 语义)共 16;矩阵/e2e 不变;
 > fuzz_headers 32666 + fuzz_mutate 2040 CRASH=0。
 
+> **M3-L5 音频容器(2026-10-31)**:detect 增 Flac/Ape/Shn 魔数(`fLaC`/"MAC "/`ajkg`)+
+> 扩展名路由;extract/list/test 语义 = 解码为单条目 `{stem}.wav`(patool 对齐;有 RIFF
+> 信封的 SHN 保留原 chunk 布局仅修正 RIFF/data size)。实现:FLAC=claxon(流式样本
+> 限额);APE=ape-decoder(仅 3.95+,旧版清晰报错,info 预估预检限额);SHN=**自研解码器
+> `src/shn.rs`**(oxideav-shorten 0.0.3 与 0.0.4 对 GNU shorten 实产 t.shn 均报
+> OverflowingUvar——其命令表/位流模型与真实 v2 流不符,弃用;自写 clean-room 实现,
+> 依据 TR.156/公开格式事实,字段语义经 GNU 产物字节级校准,未复制任何第三方代码;
+> v0/v1 与 u-law/alaw 有损 filetype 明确报错)。oracle:t.flac→t.flac.wav、
+> t.ape→t.wav、t.shn→t.wav 全部 **cmp 字节全等**。单测 +2(shn oracle 对照 +
+> 畸形输入不 panic)共 18。矩阵 MATCH=81/NOREF-OK=25(音频 6 行 FAIL→NOREF-OK;
+> 7z/unar 无音频 ref)/MISMATCH=0/FAIL=24。e2e(新增 `poc/e2e.sh` 固化脚本):
+> total=133 OK=105 REFUSED=26 BAD=2(仅 p.arc 上游)。注:unarc 对无密 t.arc 在
+> ANYARC_PASSWORD 环境下会误解密致 extract CRC 报错(上游怪癖,e2e 已按 p.* 才带密码;
+> 列入 M5 upstream 报告素材)。fuzz_mutate 增 t.flac/t.ape/t.shn 与 fuzz_headers 增
+> 音频头区复跑:mutate 10800(N=200×54)+ headers 36918,CRASH=0 / TIMEOUT=0。
+
 | L3 接 crate | lzma 单流(.lzma)、lzip(.lz)、lz4(.lz4) | lzma-rs(raw,MIT)+ lzma-rust2(LzipReader,Apache-2.0)+ lz4_flex(MIT);**bzip3 排除**(绑定 LGPL-3 C 库,转 Backlog) | **M2-b1 完成**(2026-10-31) |
 | L4 spec 重写 | udf、chm | 按公开规范纯 Rust 实现 | **Backlog 再议**(2026-10-30:需求弱,不排期)。2026-10-31:混合介质(ISO9660+UDF)已可按标准 AVDP(`BEA01VRS`@LBA256/512)与 genisoimage 内嵌指针(LBA18/19)识别,路由 Backlog 报错而非误走 ISO 解析) |
-| L5 音频容器 | flac(`claxon`)、ape(`mac`)、shn(`shorten`) | crate 接入,只读 | M3 |
+| L5 音频容器 | flac(`claxon`)、ape(`ape-decoder`)、shn(自研 `src/shn.rs`) | crate 接入 + 自写位流解码,只读 | **M3-L5 完成**(2026-10-31,oracle 字节全等) |
 | L6 Backlog | alz(ARK,GPL 冲突)、freearc(codec 许可证差)、**bzip3(官方实现为 LGPL-3 C 绑定,2026-10-31 排除)**、zpaq/shar/wav(本就外部工具语义)、vhd/wim(磁盘镜像) | **Backlog 再议**;过渡行为 = 识别格式 + 报错指引 | 不排期 |
 | 永久禁区 | **RAR create** | 无算法/许可证 | 文档明示 |
 

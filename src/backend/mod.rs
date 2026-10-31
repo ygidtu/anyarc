@@ -34,6 +34,12 @@ pub enum Format {
     Lz4,
     /// gzip 单流(自写 MultiGzDecoder,多成员拼接)
     Gz,
+    /// FLAC(解码为 WAV)
+    Flac,
+    /// Monkey's Audio(解码为 WAV)
+    Ape,
+    /// Shorten(解码为 WAV)
+    Shn,
 }
 
 impl Format {
@@ -49,6 +55,9 @@ impl Format {
             Format::Lzip => "lzip".into(),
             Format::Gz => "GZip".into(),
             Format::Lz4 => "lz4".into(),
+            Format::Flac => "FLAC".into(),
+            Format::Ape => "APE".into(),
+            Format::Shn => "Shorten".into(),
         }
     }
 }

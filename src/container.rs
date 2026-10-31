@@ -211,6 +211,28 @@ pub fn open(path: &Path, det: &Detected, opts: &OpenOptions) -> anyhow::Result<B
                 )]
             }
         }
+        // L5 音频:解码为 PCM 并包 44B WAV 头,单条目 {stem}.wav
+        Container::Flac | Container::Ape | Container::Shn => {
+            let cap = opts.max_entry_size.unwrap_or(u64::MAX);
+            let (fmt_label, bytes) = decode_audio(container, &data, cap)?;
+            let name = match &opts.single_file_name {
+                Some(n) => n.clone(),
+                None => audio_out_name(path),
+            };
+            vec![(
+                Entry {
+                    name,
+                    kind: EntryKind::File,
+                    size: bytes.len() as u64,
+                    compressed_size: data.len() as u64,
+                    method: fmt_label.into(),
+                    mtime_epoch: None,
+                    encrypted: false,
+                    link_target: None,
+                },
+                Fetch::Inline(bytes),
+            )]
+        }
     };
     let fmt = match container {
         Container::Ar => Format::Ar,
@@ -222,6 +244,9 @@ pub fn open(path: &Path, det: &Detected, opts: &OpenOptions) -> anyhow::Result<B
         Container::Lzip => Format::Lzip,
         Container::Lz4 => Format::Lz4,
         Container::Gz => Format::Gz,
+        Container::Flac => Format::Flac,
+        Container::Ape => Format::Ape,
+        Container::Shn => Format::Shn,
     };
     Ok(Box::new(ContainerBackend::new(fmt, path, plan, opts.max_entry_size)))
 }
@@ -942,6 +967,181 @@ fn single_stem(path: &Path) -> Option<String> {
         }
     }
     None
+}
+
+// ------------------------------------------------------------------ L5 音频
+
+/// 音频解码输出名:去 .foo 伪装、去音频扩展,换 `.wav`(patool 语义:
+/// flac/ape/shn 解压产物为 {stem}.wav)。
+fn audio_out_name(path: &Path) -> String {
+    let name = path.file_name().and_then(|s| s.to_str()).unwrap_or("audio");
+    let lower = name.to_lowercase();
+    let has_foo = lower.ends_with(".foo");
+    let core = if has_foo { &lower[..lower.len() - 4] } else { &lower };
+    let stem = ["flac", "ape", "shn"]
+        .iter()
+        .find_map(|e| core.strip_suffix(&format!(".{e}")))
+        .unwrap_or(core);
+    format!("{stem}.wav")
+}
+
+/// 44 字节 PCM WAV 头(无扩展 chunk,patool 生态惯例)。
+fn wav_header(channels: u16, rate: u32, bits: u16, data_len: u32) -> Vec<u8> {
+    let block_align = channels * bits / 8;
+    let mut h = Vec::with_capacity(44);
+    h.extend_from_slice(b"RIFF");
+    h.extend_from_slice(&(36 + data_len).to_le_bytes());
+    h.extend_from_slice(b"WAVE");
+    h.extend_from_slice(b"fmt ");
+    h.extend_from_slice(&16u32.to_le_bytes());
+    h.extend_from_slice(&1u16.to_le_bytes()); // PCM
+    h.extend_from_slice(&channels.to_le_bytes());
+    h.extend_from_slice(&rate.to_le_bytes());
+    h.extend_from_slice(&(rate * block_align as u32).to_le_bytes());
+    h.extend_from_slice(&block_align.to_le_bytes());
+    h.extend_from_slice(&bits.to_le_bytes());
+    h.extend_from_slice(b"data");
+    h.extend_from_slice(&data_len.to_le_bytes());
+    h
+}
+
+/// 解码音频容器为单条目 WAV 字节(限额 cap 作用于 WAV 总长)。
+/// 返回 (方法标签, WAV 字节)。
+fn decode_audio(container: Container, data: &[u8], cap: u64) -> anyhow::Result<(String, Vec<u8>)> {
+    let (label, wav) = match container {
+        Container::Flac => ("FLAC", decode_flac(data, cap)?),
+        Container::Ape => ("APE", decode_ape(data, cap)?),
+        Container::Shn => ("Shorten", decode_shn(data, cap)?),
+        _ => unreachable!("decode_audio 只处理音频容器"),
+    };
+    if wav.len() as u64 > cap {
+        anyhow::bail!("解压尺寸超过上限 {cap}(--max-entry-size)");
+    }
+    Ok((label.to_string(), wav))
+}
+
+/// FLAC → WAV(claxon)。位深:≤8 → 8u,≤16 → 16,其余 → 24(截断到 24 位,
+/// FLAC 实际罕见 >24;20/24 均按 3 字节 LE 存)。
+fn decode_flac(data: &[u8], cap: u64) -> anyhow::Result<Vec<u8>> {
+    let mut rd = claxon::FlacReader::new(std::io::Cursor::new(data))
+        .map_err(|e| anyhow::anyhow!("FLAC 打开失败: {e}"))?;
+    let si = rd.streaminfo();
+    let ch = si.channels as u16;
+    let bits: u16 = if si.bits_per_sample <= 8 {
+        8
+    } else if si.bits_per_sample <= 16 {
+        16
+    } else if si.bits_per_sample <= 24 {
+        24
+    } else {
+        anyhow::bail!("FLAC 位深 {} 不支持(>24)", si.bits_per_sample);
+    };
+    let per = usize::from(bits / 8);
+    // 预检:total_samples 已知时先估大小(未知则靠流式限额)
+    if let Some(tot) = si.samples {
+        let est = tot * u64::from(ch) * per as u64;
+        if est > 4 << 30 {
+            anyhow::bail!("FLAC 解码结果过大(≈{est} 字节),拒绝");
+        }
+    }
+    let mut pcm: Vec<u8> = Vec::new();
+    for s in rd.samples() {
+        let s = s.map_err(|e| anyhow::anyhow!("FLAC 解码失败: {e}"))?;
+        match bits {
+            8 => pcm.push((s + 128) as u8), // WAV 8-bit 为无符号
+            16 => pcm.extend_from_slice(&(s.clamp(i32::from(i16::MIN), i32::from(i16::MAX)) as i16).to_le_bytes()),
+            _ => pcm.extend_from_slice(&s.to_le_bytes()[..3]),
+        }
+        if pcm.len() > 4 << 30 || pcm.len() as u64 > cap {
+            anyhow::bail!("FLAC 解码结果过大(>{}),中止", if cap < (4 << 30) { format!("{cap} 字节(--max-entry-size)") } else { "4 GiB".into() });
+        }
+    }
+    let mut wav = wav_header(ch, si.sample_rate, bits, pcm.len() as u32);
+    wav.extend_from_slice(&pcm);
+    Ok(wav)
+}
+
+/// Monkey's Audio → WAV(ape-decoder;仅 ≥3.95,<3.95 报清晰错误)。
+/// decode_all 已按位深输出交织 LE PCM,直接配 WAV 头。
+fn decode_ape(data: &[u8], cap: u64) -> anyhow::Result<Vec<u8>> {
+    let mut dec = ape_decoder::ApeDecoder::new(std::io::Cursor::new(data))
+        .map_err(|e| anyhow::anyhow!("APE 打开失败(仅支持 APE 3.95+): {e}"))?;
+    let (ch, rate, bits) = {
+        let info = dec.info();
+        (info.channels, info.sample_rate, info.bits_per_sample)
+    };
+    if info_size_exceeds(&dec, cap) {
+        anyhow::bail!("APE 解码结果超过上限 {cap}(--max-entry-size)");
+    }
+    let pcm = dec
+        .decode_all()
+        .map_err(|e| anyhow::anyhow!("APE 解码失败: {e}"))?;
+    let mut wav = wav_header(ch, rate, bits, pcm.len() as u32);
+    wav.extend_from_slice(&pcm);
+    Ok(wav)
+}
+
+/// APE 输出大小预估(total_samples×block_align)。
+fn info_size_exceeds(dec: &ape_decoder::ApeDecoder<std::io::Cursor<&[u8]>>, cap: u64) -> bool {
+    let i = dec.info();
+    i.total_samples.saturating_mul(i.block_align as u64) > cap.saturating_sub(44)
+}
+
+/// Shorten v2/v3 → WAV(自研解码器 src/shn.rs,经 t.shn→t.wav 字节级校准)。
+/// 采样率不在 SHN 流内:若 verbatim 信封是标准 RIFF/WAVE 头则从中取;
+/// 否则按 patool 惯例默认 44100。位深按 filetype:1/2→8 位,其余 PCM→16 位。
+fn decode_shn(data: &[u8], cap: u64) -> anyhow::Result<Vec<u8>> {
+    // 每样本至少 1 字节:样本数预算取 cap/2(留 WAV 头/多字节余量)
+    let ds = crate::shn::decode(data, cap / 2)?;
+    let nch = ds.channels as usize;
+    let bits: u16 = if matches!(ds.filetype, 1 | 2) { 8 } else { 16 };
+    let mut rate = 44100u32;
+    let envelope_is_wav = ds.verbatim.len() >= 36
+        && ds.verbatim.starts_with(b"RIFF")
+        && ds.verbatim.get(8..12) == Some(b"WAVE")
+        && ds.verbatim.get(12..16) == Some(b"fmt ");
+    let mut header: Option<Vec<u8>> = None;
+    if envelope_is_wav {
+        let fmt_ch = u16::from_le_bytes([ds.verbatim[22], ds.verbatim[23]]);
+        rate = u32::from_le_bytes(ds.verbatim[24..28].try_into().unwrap());
+        let fmt_bits = u16::from_le_bytes([ds.verbatim[34], ds.verbatim[35]]);
+        if fmt_ch as usize != nch {
+            anyhow::bail!("Shorten 信封声道({fmt_ch})与流内声道({nch})不一致");
+        }
+        if fmt_bits != bits {
+            anyhow::bail!("Shorten 信封位深({fmt_bits})与 filetype({}) 不符", ds.filetype);
+        }
+        header = Some(ds.verbatim.clone());
+    }
+    let len = ds.channel_samples.iter().map(|c| c.len()).max().unwrap_or(0);
+    let per = usize::from(bits / 8);
+    let pcm_len = len * nch * per;
+    let mut wav = match header {
+        // 原 WAV 信封:保留全部 chunk 结构,仅按实际解码长度修正 RIFF/data size
+        Some(mut h) => {
+            h[4..8].copy_from_slice(&((36 + pcm_len) as u32).to_le_bytes());
+            if let Some(i) = h.windows(4).position(|w| w == b"data") {
+                if i + 8 <= h.len() {
+                    h[i + 4..i + 8].copy_from_slice(&(pcm_len as u32).to_le_bytes());
+                    h.truncate(i + 8); // data 是最后一个 chunk(信封只到头部为止)
+                }
+            }
+            h
+        }
+        None => wav_header(nch as u16, rate, bits, pcm_len as u32),
+    };
+    // GNU 内部样本与容器字节同位型(无符号类型内部即 0..N),直接按位截断写出
+    for i in 0..len {
+        for c in &ds.channel_samples {
+            let s = c.get(i).copied().unwrap_or(0);
+            if bits == 8 {
+                wav.push(s as u8);
+            } else {
+                wav.extend_from_slice(&(s as u16).to_le_bytes());
+            }
+        }
+    }
+    Ok(wav)
 }
 
 #[cfg(test)]

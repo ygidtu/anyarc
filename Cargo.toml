@@ -31,6 +31,8 @@ lzma-rs = { version = "0.3.0", features = ["raw_decoder"] }
 lz4_flex = "0.14"
 tar = "0.4.46"
 lzma-rust2 = "0.24.0"
+claxon = "0.4.3"
+ape-decoder = "0.3.2"
 
 # matrix(验收工具)需要;主二进制不用
 [dev-dependencies]

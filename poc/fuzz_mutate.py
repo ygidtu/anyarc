@@ -24,6 +24,8 @@ SUPPORTED = [
     "t.txt.lzma", "t.txt.lzma.foo", "t.tar.lzma", "t.tar.lzma.foo",
     "t.txt.lz", "t.txt.lz.foo", "t.tar.lz", "t.tar.lz.foo",
     "t.txt.lz4", "t.txt.lz4.foo",
+    # M3/L5 音频容器(claxon/ape-decoder/自写 shn 位流解码必须吃 fuzz)
+    "t.flac", "t.ape", "t.shn",
 ]
 N = int(sys.argv[1]) if len(sys.argv) > 1 else 200
 random.seed(20261031)
