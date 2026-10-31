@@ -924,6 +924,7 @@ pub fn cmd_formats() -> anyhow::Result<u8> {    // 与 detect 的兜底/黑名�
         ("adf hdf dms", "read", "Amiga 镜像"),
         ("a deb rpm cpio iso", "read", "自写容器;deb=data.tar,rpm=payload.cpio,iso=9660/Joliet"),
         ("lzma lz lz4", "read", "单流压缩(lzma-alone/lzip/LZ4 frame);tar 复合自动展开"),
+        ("flac ape shn", "read", "音频只读,解码为 {stem}.wav;flac=claxon,ape=3.95+,shn=v2/v3(v0/v1 与 u-law/alaw 报错)"),
         ("tar tar.gz tgz tar.bz2 tar.xz tar.zst zip 7z gz bz2 xz zst lzma lz lz4", "create", "写路径白名单;密码仅 zip(AES-256);RAR 创建永久禁区"),
         ("freearc alz zpaq shar vhd wim udf chm bz3", "检测但不支持", "Backlog 再议;报错并给指引"),
     ];
