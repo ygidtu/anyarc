@@ -257,6 +257,27 @@ pub struct Capabilities { read: bool, write: bool, password: bool, multi_volume:
 4. udf/chm 排期 → 同上,**转 Backlog 再议**,M3 因此瘦身至 3–4 周;
 5. crates.io 占位 → **不需要**(自用项目)。
 
+### 10.1 genozip-rs 整合评估(2026-10-31,项目位于 /mnt/data1/zhang/projects/genozip/genozip-rs)
+
+**结论:可整合,建议以“可选 feature + 库依赖”方式接入,不合并代码树。**
+
+- 契合点:MIT 许可、原创 `.grz` 容器(无 GPL/专利代码污染红线)、纯 Rust 为主、
+  库 API 与 anyarc `ArchiveBackend` 单条目语义几乎一一对应:
+  `info()→Entry{name=orig_name,size=original_size}`、`decompress()→read_current`、
+  `verify()→test`;detect 加 `GRNZ` 魔数 + `.grz` 扩展名即可路由。
+- 代价/风险:
+  1. 依赖增量:brotli、rayon、libdeflater(C)、crc32fast、xxhash、tracing 全家桶
+     (anyarc 目前无 tracing;可接受但需裁剪——建议 feature 化,默认发布二进制不含);
+  2. `.grz` 格式未定版(v2,paired/embed_ref 演进中)→ anyarc 验收基线会随对方变动;
+     patool 无基因组格式,矩阵语义=自造 fixture 对拍(对方 roundtrip/proptest 已具备);
+  3. 语义差:genozip CLI 对文本默认解压输出 **gzip**(`-p` 才纯文本),anyarc extract
+     应输出“原始文件字节”(即 decompress 的字节级往返目标),需明确条目名与内容约定
+     (orig_name 如 x.vcf.gz → 解出 x.vcf.gz,而非再套 gzip);
+  4. lz4_flex 0.11 vs 0.14、edition 2021 vs 2024:path 依赖可共存(双版本编译),但版本漂移要盯。
+- 建议路径:M4+ 之后做 `anyarc --features genomics`,新增 `src/backend/genozip.rs`
+  薄适配层(≈150 行);同时其 `progress.rs` 设计(TTY 自动降级、CJK 列宽、
+  刷新节流)已借鉴进 our `src/progress.rs` 门控思路,无需引入其代码。
+
 ## 11. 快速复现 PoC
 
 ```bash
