@@ -89,7 +89,7 @@ pub struct Capabilities { read: bool, write: bool, password: bool, multi_volume:
 | 层 | 格式 | 路线 | 状态 |
 |---|---|---|---|
 | L1 已验证 | zip jar apk epub cbz、rar cbr(含密码)、7z cb7 001(含AES)、tar 全家族、gz bz2 xz zst Z、arc arj zoo lha lzh cab | unarc-rs | PoC 通过 |
-| L1 待补验 | ace cba adf dms | unarc-rs(无参照) | PoC 自检过;M1 内做 fuzz+真实语料验证 |
+| L1 待补验 | ace cba adf dms | unarc-rs(无参照) | 变异 fuzz 10800 次 CRASH=0/TIMEOUT=0(poc/fuzz_mutate.py) |
 | L2 前端修复项 | 无扩展名 tar.gz/tbz/xz/zst、taz 消歧、freearc 误判 | 二跳探测 | M1 |
 | L2 偏移 zip | **带前置数据的 zip**(SFX、伪装成 mp4/exe 的 polyglot 档;`decrypt_zip.py` 场景) | 前端 EOCD 反向扫描(尾部 ≤128KB)→ CD 校验 → 按 Zip 强制打开(后端偏移处理已实测可用);含 WinZip AES-99/ZipCrypto 密码路径 | M1 |
 | L3 自写容器 | a(ar)、deb、rpm、cpio | 纯 Rust 手写(结构简单) | M2 |
