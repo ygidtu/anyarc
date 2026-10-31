@@ -139,6 +139,13 @@ pub struct Capabilities { read: bool, write: bool, password: bool, multi_volume:
 > 矩阵 81/19/0/30 不变;e2e OK=100 BAD=2(仅 p.arc 上游);fuzz_mutate 3060 + newc 定向 fuzz
 > 2400 CRASH=0;hpbin fixture t.cpio 行为不变。
 
+> **M3-e decrypt_zip 场景终验(2026-10-31)**:对照 poc 语义逐项验证——错密码探针(exit 1
+> “密码错误”,连续 -p 猜密码可行)、SFX/前置字节 zip(EOCD 定位+偏移告警)、GBK 名修复
+> (真 GBK fixture:list/extract `-e gbk` 输出“中文目录/文件.txt”;UTF-8 名 zip 正确解码)。
+> 加固:`--encoding` 现仅对 **cp437 可逆**的名字修复(`cp437::try_encode_str`;不可逆即原样保留),
+> 防 `-e` 误伤已正确的 UTF-8 名。单测 +2(encoding 守卫/glob 语义)共 16;矩阵/e2e 不变;
+> fuzz_headers 32666 + fuzz_mutate 2040 CRASH=0。
+
 | L3 接 crate | lzma 单流(.lzma)、lzip(.lz)、lz4(.lz4) | lzma-rs(raw,MIT)+ lzma-rust2(LzipReader,Apache-2.0)+ lz4_flex(MIT);**bzip3 排除**(绑定 LGPL-3 C 库,转 Backlog) | **M2-b1 完成**(2026-10-31) |
 | L4 spec 重写 | udf、chm | 按公开规范纯 Rust 实现 | **Backlog 再议**(2026-10-30:需求弱,不排期)。2026-10-31:混合介质(ISO9660+UDF)已可按标准 AVDP(`BEA01VRS`@LBA256/512)与 genisoimage 内嵌指针(LBA18/19)识别,路由 Backlog 报错而非误走 ISO 解析) |
 | L5 音频容器 | flac(`claxon`)、ape(`mac`)、shn(`shorten`) | crate 接入,只读 | M3 |

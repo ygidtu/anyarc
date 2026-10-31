@@ -311,8 +311,11 @@ fn fixed_name(raw: &str, enc: Option<&'static encoding_rs::Encoding>) -> String 
     if raw.is_ascii() {
         return raw.to_string();
     }
-    // 名字含非 ASCII 才处理;先按 cp437 编回字节
-    let bytes = crate::cp437::encode_str(raw);
+    // 名字含非 ASCII 才处理;先按 cp437 编回字节。
+    // 不可逆的名字(非 cp437 乱码,例如本就是正确 UTF-8)保持原样,避免误伤。
+    let Some(bytes) = crate::cp437::try_encode_str(raw) else {
+        return raw.to_string();
+    };
     let (cow, _, _) = enc.decode(&bytes);
     cow.into_owned()
 }
@@ -874,4 +877,33 @@ pub fn cmd_formats() -> anyhow::Result<u8> {
         println!("{ext:<44} {cap:<14} {note}");
     }
     Ok(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn encoding_fix_roundtrips_only_cp437_mojibake() {
+        let gbk = lookup_encoding("gbk").unwrap();
+        // cp437 乱码(GBK 字节被按 cp437 解出)→ 修复为正确中文
+        let gbk_bytes = gbk.encode("中文目录").0;
+        let mojibake = crate::cp437::decode_bytes(&gbk_bytes);
+        assert_eq!(fixed_name(&mojibake, Some(gbk)), "中文目录");
+        // 已是正确 UTF-8 名(cp437 不可逆)→ 原样保留,不被 -e 破坏
+        assert_eq!(fixed_name("中文目录", Some(gbk)), "中文目录");
+        // ASCII 名不处理
+        assert_eq!(fixed_name("plain.txt", Some(gbk)), "plain.txt");
+    }
+
+    #[test]
+    fn name_match_glob_and_substring() {
+        assert!(name_match("a.txt", "dir/a.txt", false)); // 无通配符 = 子串
+        assert!(!name_match("A.TXT", "dir/a.txt", false));
+        assert!(name_match("A.TXT", "dir/a.txt", true));
+        assert!(name_match("*/a?txt", "dir/a.txt", false));
+        assert!(!name_match("a?txt", "dir/a.txt", false)); // glob 不跨子串语义
+        assert!(name_match("dir/*", "dir/sub/x.txt", false)); // * 可跨 /
+        assert!(!name_match("zzz", "dir/a.txt", false));
+    }
 }

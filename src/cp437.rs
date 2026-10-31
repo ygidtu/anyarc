@@ -146,6 +146,20 @@ pub fn encode_str(s: &str) -> Vec<u8> {
     out
 }
 
+/// 严格版:含不可映射字符返回 None。用于 `--encoding` 修复的前置判定 —
+/// 真 cp437 乱码必然可逆;不可逆(如已是正确 UTF-8 名)则不应修复。
+pub fn try_encode_str(s: &str) -> Option<Vec<u8>> {
+    s.chars()
+        .map(|c| {
+            if (c as u32) < 0x80 {
+                Some(c as u8)
+            } else {
+                CP437_HIGH.iter().position(|&u| u == c as u16).map(|i| i as u8 + 0x80)
+            }
+        })
+        .collect()
+}
+
 /// cp437 字节 -> Unicode 字符串。
 pub fn decode_bytes(b: &[u8]) -> String {
     b.iter()
