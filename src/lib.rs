@@ -4,5 +4,6 @@ pub mod backend;
 pub mod cli;
 pub mod container;
 pub mod cp437;
+pub mod create;
 pub mod detect;
 pub mod extract;

@@ -25,6 +25,8 @@ pub enum Cmd {
     Test(TestArgs),
     /// 列出归档内容
     List(ListArgs),
+    /// 创建归档(白名单:tar 家族/zip/7z/单流压缩)
+    Create(CreateArgs),
     /// 打印格式支持表
     Formats,
 }
@@ -85,6 +87,21 @@ pub struct ListArgs {
     /// JSON 输出
     #[arg(long)]
     pub json: bool,
+}
+
+#[derive(clap::Args, Debug)]
+pub struct CreateArgs {
+    /// 第 1 个参数 = 输出归档(格式由扩展名判定),其余 = 输入文件/目录
+    pub targets: Vec<PathBuf>,
+    /// 密码(仅 zip:WinZip AES-256)
+    #[arg(short = 'p', long)]
+    pub password: Option<String>,
+    /// 覆盖已存在的输出文件
+    #[arg(long)]
+    pub overwrite: bool,
+    /// 安静模式
+    #[arg(short = 'q', long)]
+    pub quiet: bool,
 }
 
 // ---------------------------------------------------------------- 公共流程
@@ -414,7 +431,10 @@ pub fn cmd_list(args: &ListArgs) -> anyhow::Result<u8> {
     let enc = args.common.encoding.as_deref().map(lookup_encoding).transpose()?;
     for path in &args.common.archives {
         let det = detect_with_warning(path, args.common.quiet)?;
-        let mut ar = open_verified(path, &det, &args.common)?;
+        // list 只需元数据:不跑密码探针(加密 zip 中央目录本身明文;
+        // 7z 头加密时 backend::open 自会要求密码并报错)。
+        let opts = open_opts(&args.common, path);
+        let mut ar = backend::open(path, &det, &opts)?;
         if args.json {
             println!("{{\"archive\":\"{}\",\"format\":\"{}\",\"entries\":[", path.display(), ar.format().name());
         }
@@ -513,6 +533,27 @@ fn lookup_encoding(name: &str) -> anyhow::Result<&'static encoding_rs::Encoding>
         .ok_or_else(|| anyhow::anyhow!("未知编码标签: {name}(试试 gbk / big5 / shift_jis / windows-1251)"))
 }
 
+pub fn cmd_create(args: &CreateArgs) -> anyhow::Result<u8> {
+    if args.targets.len() < 2 {
+        eprintln!("用法: anyarc create <输出归档> <文件/目录>...(格式白名单见 anyarc formats)");
+        return Ok(2); // 用法错误
+    }
+    let out = &args.targets[0];
+    let inputs = &args.targets[1..];
+    let env_pw = std::env::var("ANYARC_PASSWORD").ok().filter(|s| !s.is_empty());
+    let password = args.password.as_deref().or(env_pw.as_deref());
+    let n = crate::create::create(&crate::create::CreateOptions {
+        out,
+        inputs,
+        password,
+        overwrite: args.overwrite,
+    })?;
+    if !args.quiet {
+        eprintln!("已创建 {}({} bytes)← {} 个输入条目", out.display(), n, inputs.len());
+    }
+    Ok(0)
+}
+
 pub fn cmd_formats() -> anyhow::Result<u8> {
     // 与 detect 的兜底/黑名单保持一致的能力表
     const ROWS: &[(&str, &str, &str)] = &[
@@ -526,7 +567,9 @@ pub fn cmd_formats() -> anyhow::Result<u8> {
         ("ace cba", "read", "无外部参照,变异 fuzz 通过"),
         ("adf hdf dms", "read", "Amiga 镜像"),
         ("a deb rpm cpio iso", "read", "自写容器;deb=data.tar,rpm=payload.cpio,iso=9660/Joliet"),
-        ("freearc alz zpaq shar vhd wim udf chm lzma", "检测但不支持", "Backlog 再议;报错并给指引"),
+        ("lzma lz lz4", "read", "单流压缩(lzma-alone/lzip/LZ4 frame);tar 复合自动展开"),
+        ("tar tar.gz tgz tar.bz2 tar.xz tar.zst zip 7z gz bz2 xz zst lzma lz lz4", "create", "写路径白名单;密码仅 zip(AES-256);RAR 创建永久禁区"),
+        ("freearc alz zpaq shar vhd wim udf chm bz3", "检测但不支持", "Backlog 再议;报错并给指引"),
     ];
     println!("{:<44} {:<14} 说明", "扩展名", "能力");
     for (ext, cap, note) in ROWS {

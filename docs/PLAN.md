@@ -109,6 +109,13 @@ pub struct Capabilities { read: bool, write: bool, password: bool, multi_volume:
 > (t.txt.lz→t.txt sha 73475cb4…;t.tar.lz→tar 树)。手写 lzip varint 解析曾把 payload props 字节
 > 误并入 bds(LEB 无 continuation 位歧义)→ 改用 lzma-rust2 标准 LzipReader。
 
+> **M2-b2 验收(2026-10-31)**:`create` 写路径白名单落地(tar 家族 12 变体、zip(deflate+WinZip AES-256)、
+> 7z(LZMA2)、单流 gz/bz2/xz/zst/lzma/lz/lz4;临时文件+rename;无 `--overwrite` 拒覆盖;目录输入按
+> basename 作归档根;symlink 走 tar `append_link`/zip `add_symlink`)。7z 26.04 实测互读 tar*/zip/7z/lzma 全绿,
+> `.lz/.lz4` 互读失败系 7z 自身无 LZIP/LZ4 格式项(`7z i` 实证),非我方产物问题。7z 创建密码(7zAES)缺编码器
+> → 清晰报错。list 改为免密码探针(加密条目名可列,`*` 标记)。回归:单测 12 全绿;矩阵 130 例
+> MATCH=81/NOREF-OK=19/MISMATCH=0/FAIL=30 不变;e2e OK=100 BAD=2(仅 p.arc 上游);fuzz 复跑通过。
+
 | L3 接 crate | lzma 单流(.lzma)、lzip(.lz)、lz4(.lz4) | lzma-rs(raw,MIT)+ lzma-rust2(LzipReader,Apache-2.0)+ lz4_flex(MIT);**bzip3 排除**(绑定 LGPL-3 C 库,转 Backlog) | **M2-b1 完成**(2026-10-31) |
 | L4 spec 重写 | udf、chm | 按公开规范纯 Rust 实现 | **Backlog 再议**(2026-10-30:需求弱,不排期)。2026-10-31:混合介质(ISO9660+UDF)已可按标准 AVDP(`BEA01VRS`@LBA256/512)与 genisoimage 内嵌指针(LBA18/19)识别,路由 Backlog 报错而非误走 ISO 解析) |
 | L5 音频容器 | flac(`claxon`)、ape(`mac`)、shn(`shorten`) | crate 接入,只读 | M3 |
@@ -121,8 +128,8 @@ pub struct Capabilities { read: bool, write: bool, password: bool, multi_volume:
 |---|---|
 | `anyarc extract [-o DIR] [--password P] [--overwrite] [--encoding enc] <arch>...` | L1–L3 全格式;分卷自动聚合;**前置数据 zip 自动 EOCD 定位并告警偏移量** |
 | `anyarc test [-v]` | 同上,只解码校验 CRC 不落盘 |
-| `anyarc list [-l/-t]` | 条目名/大小/时间 |
-| `anyarc create <out> <files>...` | **白名单**:tar(.gz/.bz2/.xz/.zst)、zip(deflate/AES)、7z(LZMA2/AES)、bz2/gz/zst/xz 单流。密码仅 zip(AES)/7z |
+| `anyarc list [-l/--json]` | 条目名/大小/时间/方法/加密标记;加密条目无密码也可列出(zip 中央目录明文;7z 头加密则 open 即要求密码)。注:`-t` 早期草拟,实际由 `-l` 覆盖 |
+| `anyarc create <out> <files>...` | **白名单**:tar(.gz/.bz2/.xz/.zst/.lzma/.lz/.lz4 及各缩写)、zip(deflate/WinZip AES-256)、7z(LZMA2)、单流 gz/bz2/xz/zst/lzma/lz/lz4(恰好 1 输入)。密码仅 zip AES(7zAES 编码器缺位→清晰报错);RAR 创建永久禁区;先写 `*.anyarc-tmp` 再 rename,无 `--overwrite` 拒绝覆盖。7z 26.04 实测互读:tar*/zip/7z/lzma ✓;`.lz/.lz4` 非我方缺陷(7z 格式表无 LZIP/LZ4) |
 | `anyarc repack <in> <out>` | in 按 L1–L3 读,out 按 create 白名单 |
 | `anyarc diff <a> <b>` | 条目名+内容哈希差异(v1);文本级 diff(v2) |
 | `anyarc search <pattern> <arch>...` | 条目名匹配(v1);解流内容 grep(v2) |
