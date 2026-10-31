@@ -86,6 +86,9 @@ pub struct ExtractArgs {
     /// 输出目录(默认当前目录)
     #[arg(short = 'o', long, default_value = ".")]
     pub out: PathBuf,
+    /// 递归解压:解出的文件若仍是可识别归档,继续向内解一层(中间归档移除)
+    #[arg(short = 'r', long)]
+    pub recursive: bool,
 }
 
 #[derive(clap::Args, Debug)]
@@ -339,12 +342,58 @@ pub fn cmd_extract(args: &ExtractArgs) -> anyhow::Result<u8> {
     for path in &args.common.archives {
         let det = detect_with_warning(path, args.common.quiet)?;
         let mut ar = open_verified(path, &det, &args.common)?;
-        if let Err(e) = extract_one(ar.as_mut(), path, args, enc) {
-            eprintln!("错误: {}: {e:#}", path.display());
-            failures += 1;
+        match extract_one(ar.as_mut(), path, args, enc, &args.out, false) {
+            Err(e) => {
+                eprintln!("错误: {}: {e:#}", path.display());
+                failures += 1;
+            }
+            Ok(written) => {
+                if args.recursive {
+                    peel_nested(&written, args, enc, 1)?;
+                }
+            }
         }
     }
     Ok(if failures == 0 { 0 } else { 1 })
+}
+
+/// 递归解压上限(层):防自嵌循环/异常深链(zip 内再放同名 zip 等)。
+const MAX_RECURSE_DEPTH: usize = 16;
+
+/// 对刚解出的文件逐个探测:仍是可识别归档 → 就地解压到其所在目录,
+/// 成功后移除该中间归档并继续向内;叶子文件(不可识别)原样保留。
+/// 自嵌循环由两层机制兜底:深度上限告警 + 同名条目覆盖策略跳过(inner 为空即停)。
+fn peel_nested(files: &[PathBuf], args: &ExtractArgs, enc: Option<&'static encoding_rs::Encoding>, depth: usize) -> anyhow::Result<()> {
+    if depth > MAX_RECURSE_DEPTH {
+        eprintln!("警告: 递归解压已达 {MAX_RECURSE_DEPTH} 层上限(疑似自嵌归档),停止向内");
+        return Ok(());
+    }
+    for f in files {
+        let det = match detect::detect(f) {
+            Ok(Some(d)) => d,
+            // 不可识别 → 叶子;探测 IO 错误也按叶子保留
+            _ => continue,
+        };
+        let dest = f.parent().unwrap_or(Path::new(".")).to_path_buf();
+        let extracted = open_verified(f, &det, &args.common)
+            .and_then(|mut ar| extract_one(ar.as_mut(), f, args, enc, &dest, true));
+        match extracted {
+            Ok(inner) if !inner.is_empty() => {
+                // 解出真实内容才移除中间归档;空产物(被覆盖策略跳过等)保留原文件
+                std::fs::remove_file(f).map_err(|e| anyhow::anyhow!("移除中间归档 {}: {e}", f.display()))?;
+                if !args.common.quiet {
+                    eprintln!("递归: {} → {} 个条目落盘(中间归档已移除,第 {} 层)", f.display(), inner.len(), depth);
+                }
+                peel_nested(&inner, args, enc, depth + 1)?;
+            }
+            Ok(_) => {}
+            Err(e) => {
+                // 内层解压失败:保留该文件为普通叶子,不阻断其余条目
+                eprintln!("警告: 嵌套解压跳过 {}: {e:#}", f.display());
+            }
+        }
+    }
+    Ok(())
 }
 
 fn extract_one(
@@ -352,8 +401,9 @@ fn extract_one(
     path: &Path,
     args: &ExtractArgs,
     enc: Option<&'static encoding_rs::Encoding>,
-) -> anyhow::Result<()> {
-    let dest = &args.out;
+    dest: &Path,
+    nested: bool,
+) -> anyhow::Result<Vec<PathBuf>> {
     std::fs::create_dir_all(dest)?;
     let single = ar.is_single_file();
     let show_bar = crate::extract::is_tty() && !args.common.quiet;
@@ -361,6 +411,8 @@ fn extract_one(
     let mut n_dir = 0usize;
     let mut n_skipped = 0usize;
     let mut n_overwrite_skip = 0usize;
+    // 落盘的常规文件路径(供 --recursive 逐层探测嵌套归档)
+    let mut written: Vec<PathBuf> = Vec::new();
     let mut bar = crate::progress::ExtractBar::new(show_bar && !single);
     // 捐赠者尚未出现的硬链接(pass 2 处理;cpio 允许 dup 排在数据条目之前)
     let mut deferred_links: Vec<(std::path::PathBuf, String)> = Vec::new();
@@ -385,6 +437,17 @@ fn extract_one(
                     ar.skip_current()?;
                     continue;
                 };
+                // 自引用条目(解出目标即归档文件本身):流式读会先截断数据源,必须跳过。
+                // 词法相等或两者均存在时 canonical 相等(覆盖 ./x vs x 等场景)。
+                let self_ref = p.components().eq(path.components()) || {
+                    p.exists() && p.canonicalize().is_ok_and(|a| path.canonicalize().is_ok_and(|b| a == b))
+                };
+                if self_ref {
+                    eprintln!("警告: 跳过自引用条目 {name}(解出路径与归档文件相同)");
+                    n_skipped += 1;
+                    ar.skip_current()?;
+                    continue;
+                }
                 if p.exists() && !args.common.overwrite {
                     n_overwrite_skip += 1;
                     ar.skip_current()?;
@@ -408,6 +471,7 @@ fn extract_one(
                     drop(w);
                 }
                 n_file += 1;
+                written.push(p);
             }
             EntryKind::Symlink => {
                 let Some(target) = entry.link_target else {
@@ -486,6 +550,7 @@ fn extract_one(
                     ar.read_current_to(&mut w)?;
                     drop(w);
                     n_file += 1;
+                    written.push(p);
                 }
             }
             EntryKind::Special => {
@@ -518,7 +583,7 @@ fn extract_one(
         n_file += 1;
     }
     bar.finish();
-    if !args.common.quiet && crate::extract::is_tty() {
+    if !nested && !args.common.quiet && crate::extract::is_tty() {
         eprintln!("解压完成: {} 个文件, {} 个目录({})", n_file, n_dir, path.display());
     }
     if n_skipped > 0 {
@@ -527,7 +592,7 @@ fn extract_one(
     if n_overwrite_skip > 0 && !args.common.quiet {
         eprintln!("提示: {} 个已存在文件未覆盖(用 --overwrite 强制)", n_overwrite_skip);
     }
-    Ok(())
+    Ok(written)
 }
 
 pub fn cmd_test(args: &TestArgs) -> anyhow::Result<u8> {
@@ -979,5 +1044,82 @@ mod tests {
         assert!(!name_match("a?txt", "dir/a.txt", false)); // glob 不跨子串语义
         assert!(name_match("dir/*", "dir/sub/x.txt", false)); // * 可跨 /
         assert!(!name_match("zzz", "dir/a.txt", false));
+    }
+
+    /// --recursive:zip → tar.gz → tar → 叶子文件,一次性直达最内层;
+    /// 中间归档移除,叶子(非归档)保留,与 test.zip 实链同构。
+    #[test]
+    fn recursive_extract_reaches_leaf() {
+        use std::io::Write as _;
+        let payload = b"inner-most-miniconda-like-sh".to_vec();
+
+        // 1) tar(单条目 leaf.sh)
+        let mut tar_bytes = Vec::new();
+        {
+            let mut tb = tar::Builder::new(&mut tar_bytes);
+            let mut header = tar::Header::new_gnu();
+            header.set_size(payload.len() as u64);
+            header.set_mode(0o755);
+            header.set_cksum();
+            tb.append_data(&mut header, "leaf.sh", &payload[..]).unwrap();
+            tb.finish().unwrap();
+        }
+        // 2) gzip(tar) → test.tar.gz
+        let mut gzb = Vec::new();
+        {
+            let mut e = flate2::write::GzEncoder::new(&mut gzb, flate2::Compression::default());
+            e.write_all(&tar_bytes).unwrap();
+            e.finish().unwrap();
+        }
+        // 3) zip 内含 test.tar.gz
+        let dir = std::env::temp_dir().join(format!("anyarc_rec_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let outer = dir.join("outer.zip");
+        {
+            let mut zw = zip::ZipWriter::new(std::fs::File::create(&outer).unwrap());
+            let opts: zip::write::FileOptions<'_, '_, ()> =
+                zip::write::FileOptions::default().compression_method(zip::CompressionMethod::Stored);
+            zw.start_file("test.tar.gz", opts).unwrap();
+            zw.write_all(&gzb).unwrap();
+            zw.finish().unwrap();
+        }
+        // 4) 递归解压
+        let out = dir.join("o");
+        let args = ExtractArgs {
+            common: CommonArgs {
+                archives: vec![outer],
+                password: None,
+                overwrite: false,
+                encoding: None,
+                max_entry_size: None,
+                max_total_size: None,
+                quiet: true,
+            },
+            out: out.clone(),
+            recursive: true,
+        };
+        assert_eq!(cmd_extract(&args).unwrap(), 0);
+        assert_eq!(std::fs::read(out.join("leaf.sh")).unwrap(), payload, "最内层叶子应直达落盘");
+        assert!(!out.join("test.tar.gz").exists(), "中间归档应移除");
+        assert!(!out.join("test.tar").exists(), "不应落地中间 tar");
+        // 5) 非递归对照组:只解一层,停在 test.tar.gz
+        let out1 = dir.join("o1");
+        let args1 = ExtractArgs {
+            common: CommonArgs {
+                archives: vec![dir.join("outer.zip")],
+                password: None,
+                overwrite: false,
+                encoding: None,
+                max_entry_size: None,
+                max_total_size: None,
+                quiet: true,
+            },
+            out: out1.clone(),
+            recursive: false,
+        };
+        assert_eq!(cmd_extract(&args1).unwrap(), 0);
+        assert!(out1.join("test.tar.gz").exists() && !out1.join("leaf.sh").exists());
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }
