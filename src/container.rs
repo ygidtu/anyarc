@@ -116,7 +116,9 @@ pub(crate) fn decompress(comp: Comp, raw: &[u8], cap: u64) -> anyhow::Result<Vec
     let mut out = Vec::new();
     match comp {
         Comp::Gzip => {
-            let mut d = flate2::read::GzDecoder::new(raw).take(cap + 1);
+            // MultiGzDecoder:多成员 gzip 全量拼接(与 gzip/7z/patool 语义一致;
+            // flate2 的 GzDecoder 只解第一个成员)
+            let mut d = flate2::read::MultiGzDecoder::new(raw).take(cap + 1);
             d.read_to_end(&mut out)?;
         }
         Comp::Bzip2 => {
@@ -177,11 +179,12 @@ pub fn open(path: &Path, det: &Detected, opts: &OpenOptions) -> anyhow::Result<B
         Container::Cpio => parse_cpio(&data)?,
         Container::Iso => parse_iso(&data)?,
         // 单流压缩:先整体解压(限额),再判定是 tar 复合还是单条目
-        Container::LzmaAlone | Container::Lzip | Container::Lz4 => {
+        Container::LzmaAlone | Container::Lzip | Container::Lz4 | Container::Gz => {
             let comp = match container {
                 Container::LzmaAlone => Comp::LzmaAlone,
                 Container::Lzip => Comp::Lzip,
-                _ => Comp::Lz4,
+                Container::Lz4 => Comp::Lz4,
+                _ => Comp::Gzip,
             };
             let cap = opts.max_entry_size.unwrap_or(u64::MAX);
             let bytes = decompress(comp, &data, cap)?;
@@ -218,6 +221,7 @@ pub fn open(path: &Path, det: &Detected, opts: &OpenOptions) -> anyhow::Result<B
         Container::LzmaAlone => Format::LzmaAlone,
         Container::Lzip => Format::Lzip,
         Container::Lz4 => Format::Lz4,
+        Container::Gz => Format::Gz,
     };
     Ok(Box::new(ContainerBackend::new(fmt, path, plan, opts.max_entry_size)))
 }
@@ -887,7 +891,7 @@ fn single_stem(path: &Path) -> Option<String> {
     let has_foo = lower.ends_with(".foo");
     // 压缩后缀是 ASCII:按字节长切原始名安全(伪装的 .foo 同为 ASCII 尾)
     let core = if has_foo { &lower[..lower.len() - 4] } else { &lower };
-    for suf in [".lzma", ".lz4", ".lz"] {
+    for suf in [".lzma", ".lz4", ".lz", ".gz"] {
         if core.ends_with(suf) {
             let cut = name.len() - suf.len() - if has_foo { 4 } else { 0 };
             return Some(name[..cut].to_string());
@@ -909,7 +913,7 @@ mod tests {
         assert_eq!(p("x.lz").as_deref(), Some("x"));
         assert_eq!(p("x.LZ4.foo").as_deref(), Some("x"));
         assert_eq!(p("noext").as_deref(), None);
-        assert_eq!(p("t.txt.gz").as_deref(), None); // gz 走 unarc 路径,不经此函数
+        assert_eq!(p("t.txt.gz").as_deref(), Some("t.txt")); // gz 也走自写 MultiGz 路径
     }
 
     #[test]

@@ -32,6 +32,8 @@ pub enum Format {
     Lzip,
     /// LZ4 frame
     Lz4,
+    /// gzip 单流(自写 MultiGzDecoder,多成员拼接)
+    Gz,
 }
 
 impl Format {
@@ -45,6 +47,7 @@ impl Format {
             Format::Iso => "iso".into(),
             Format::LzmaAlone => "lzma".into(),
             Format::Lzip => "lzip".into(),
+            Format::Gz => "GZip".into(),
             Format::Lz4 => "lz4".into(),
         }
     }

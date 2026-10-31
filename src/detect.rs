@@ -54,6 +54,8 @@ pub enum Container {
     Lzip,
     /// LZ4 frame(.lz4)
     Lz4,
+    /// gzip 单流(自写 MultiGzDecoder:unarc 只解第一个成员,多成员语义不符)
+    Gz,
 }
 
 /// 探测结果。`prefix_bytes` 仅对 Zip 有意义:zip 体前的junk 数据长度
@@ -147,6 +149,12 @@ pub fn detect(path: &Path) -> std::io::Result<Option<Detected>> {
         (Some(k @ Known::Backlog(_)), _) => Some(k),
         (None, Some(k)) => Some(k),
         (None, None) => None,
+    };
+    // gz 单流改走自写 MultiGzDecoder(unarc 只解第一个成员,多成员不符 gzip/7z/patool 语义;
+    // 复合(tar in gz)由 container 的 looks_tar 分支等价处理,不再经二跳)
+    let base = match base {
+        Some(Known::Unarc(ArchiveFormat::Gz)) => Some(Known::Container(Container::Gz)),
+        k => k,
     };
 
     // 3) 复合流二跳:单流压缩头 → 解压 peek tar header

@@ -116,6 +116,11 @@ pub struct Capabilities { read: bool, write: bool, password: bool, multi_volume:
 > → 清晰报错。list 改为免密码探针(加密条目名可列,`*` 标记)。回归:单测 12 全绿;矩阵 130 例
 > MATCH=81/NOREF-OK=19/MISMATCH=0/FAIL=30 不变;e2e OK=100 BAD=2(仅 p.arc 上游);fuzz 复跑通过。
 
+> **M2-b3 加固(2026-10-31)**:复现并修复 unarc 0.8.1 gzip 单流只解**第一个成员**的语义缺陷
+> (多成员 .gz 实测 6B vs 12B 全量,不符 gzip/7z/patool):`.gz` 改路由自写 `MultiGzDecoder`
+> (detect `Container::Gz`;复合 tar-in-gz 由 looks_tar 等价处理,`taz` 二跳自然退役)。
+> 回归:多成员/单成员/不同级别 gz 9 例全对;矩阵 81/19/0/30 不变;e2e OK=100;fuzz_headers 增 t.txt.gz 头区。
+
 | L3 接 crate | lzma 单流(.lzma)、lzip(.lz)、lz4(.lz4) | lzma-rs(raw,MIT)+ lzma-rust2(LzipReader,Apache-2.0)+ lz4_flex(MIT);**bzip3 排除**(绑定 LGPL-3 C 库,转 Backlog) | **M2-b1 完成**(2026-10-31) |
 | L4 spec 重写 | udf、chm | 按公开规范纯 Rust 实现 | **Backlog 再议**(2026-10-30:需求弱,不排期)。2026-10-31:混合介质(ISO9660+UDF)已可按标准 AVDP(`BEA01VRS`@LBA256/512)与 genisoimage 内嵌指针(LBA18/19)识别,路由 Backlog 报错而非误走 ISO 解析) |
 | L5 音频容器 | flac(`claxon`)、ape(`mac`)、shn(`shorten`) | crate 接入,只读 | M3 |

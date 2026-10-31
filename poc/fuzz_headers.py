@@ -17,10 +17,11 @@ TARGETS = {
     "t.rpm":   [(0, 120), (1384, 1500), (8320, 8400)],  # lead / 主头 / payload magic
     "t.cpio":  [(0, 200)],                       # hpbin 头 + 名字
     "t.iso":   [(32768, 33024), (34816, 35072), (0xf000, 0xf044 + 72)],  # PVD/SVD/根目录记录
-    # 单流压缩头:lzma props+dict(13B)/lzip 成员头+trailer/lz4 frame 头+block 头
+    # 单流压缩头:lzma props+dict(13B)/lzip 成员头+trailer/lz4 frame 头+block 头/gzip 头+多成员边界
     "t.txt.lzma": [(0, 13)],
     "t.txt.lz":   [(0, 16), (30, 38)],
     "t.txt.lz4":  [(0, 7), (7, 15)],
+    "t.txt.gz":   [(0, 10)],
 }
 VALUES = [0x00, 0x01, 0x02, 0x34, 0x41, 0x7F, 0x80, 0xC7, 0xFF]
 TIMEOUT = 10
