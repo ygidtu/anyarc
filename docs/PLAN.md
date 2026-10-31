@@ -278,6 +278,43 @@ pub struct Capabilities { read: bool, write: bool, password: bool, multi_volume:
   薄适配层(≈150 行);同时其 `progress.rs` 设计(TTY 自动降级、CJK 列宽、
   刷新节流)已借鉴进 our `src/progress.rs` 门控思路,无需引入其代码。
 
+### 10.2 genozip-rs vs quip 对比实测(2026-10-31,quip=/home/zym/software/quip,dcjones/quip 1.1.8,BSD)
+
+**代码逻辑两条技术路线**:
+- quip:自适应高阶 Markov(seqenc.c order-11 + 前缀位置模型;qualenc.c 三进制分箱
+  order-3)+ 自研区间编码器(ac.c)+ ID token 级 delta(idenc.c)+ 可选 de novo
+  装配(assembler.c,dlCBF 概率 de Bruijn 图)或参考基因组(seqmap)把 read 编码为
+  坐标+motif。序列化、有状态 → 压缩率极高,并行性差、解码慢。
+- genozip-rs:列式转置(VBlock→字段 Section)+ 专用变换(acgt2bit/delta/PBWT)+
+  通用压缩择优(stored/flate/brotli/lz4 auto)。可分块 → 并行好、解码极快。
+
+**同机实测**(x86_64,8+ 核;往返全部字节级通过,quip 对 FASTQ;BAM 见兼容性):
+
+| 用例 | quip | genozip-rs(auto) | gzip -6 |
+|---|---|---|---|
+| 333MB NovaSeq FASTQ(Q 串恒定) | 26.1MB / 12.2x / 压12.4s | 37.3MB / 8.5x / 压4.4s | 49.2MB / 6.5x / 32.8s |
+| 92MB CG FASTQ(Q 多样) | 3.6MB / 24.2x / 压2.2s | 7.2MB / 12.3x | 7.6MB |
+| 同上解压 | 17MB/s | ~490MB/s(26 倍)| — |
+| 250MB BAM 子集(SRX25620975) | 27.9MB(输入 BGZF 28MB → 文件级 1.15x)/ 压11.4s | 23.1MB(逻辑 10.8x)/ 压7.0s | — |
+| BAM 往返 | 解出非 BGZF 裸 BAM,**无法复现原文件字节** | 逻辑 BAM 字节级一致(BGZF 块边界可不同) | — |
+
+**格式兼容性结论:genozip-rs 明显更好**。quip 无 VCF;BAM 输入必须 BGZF(自带
+2012 版 bam.c 检查 EOF 块,裸 BAM 直接拒绝);解压 BAM 不回原字节(重编码语义);
+无 paired 容器;项目 2017-12 停更(dcjones/quip),仅 MD5 脚本测试,C 构建依赖
+zlib/bz2。genozip-rs:VCF/SAM/BAM/FASTQ + .gz 输入 + paired + embed_ref,
+proptest/roundtrip/criterion 齐备,活跃维护。
+
+**性能结论:genozip-rs 明显更好**(压缩 wall-clock 快 2–3x,解压快 ~30x;
+quip CPU 占用 ~1.6 核,genozip-rs rayon 并行 4–26 核)。
+
+**压缩率结论:quip 明显更好**(质量流高阶自适应模型对真实测序数据优势 2x 上下;
+恒定 Q 场景也赢;reference/assembly 模式还有额外一大截潜力)。
+
+**对 anyarc 的含义**:整合候选仍是 genozip-rs(库 API 对应单条目后端、feature 化
+依赖可控)。quip 不建议整合(无库接口、停更 C 代码、运行时 zlib/bz2 依赖违背
+零系统依赖红线);其价值是"格式识别 + 明确报错指引"即可(detect 加 `FF 51 55 49 50 00`
+magic → 提示用 quip),列 Backlog M5+。
+
 ## 11. 快速复现 PoC
 
 ```bash
