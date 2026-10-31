@@ -6,8 +6,9 @@ import os, random, subprocess, sys, tempfile, shutil
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 BIN_SRC = os.path.join(ROOT, "target/release/anyarc")
-BIN = os.path.join(tempfile.gettempdir(), "anyarc_fuzz_bin")
+BIN = os.path.join("/tmp/opencode", "anyarc_fuzz_bin")
 shutil.copyfile(BIN_SRC, BIN)
+os.chmod(BIN, 0o755)
 DATA = os.environ.get("ANYARC_FIXTURES", "/home/zym/code/patool/tests/data")
 # 只 fuzz 已知可读的格式(L1 支持集)
 SUPPORTED = [

@@ -93,6 +93,12 @@ pub struct Capabilities { read: bool, write: bool, password: bool, multi_volume:
 | L2 前端修复项 | 无扩展名 tar.gz/tbz/xz/zst、taz 消歧、freearc 误判 | 二跳探测 | M1 |
 | L2 偏移 zip | **带前置数据的 zip**(SFX、伪装成 mp4/exe 的 polyglot 档;`decrypt_zip.py` 场景) | 前端 EOCD 反向扫描(尾部 ≤128KB)→ CD 校验 → 按 Zip 强制打开(后端偏移处理已实测可用);含 WinZip AES-99/ZipCrypto 密码路径 | M1 |
 | L3 自写容器 | a(ar)、deb、rpm、cpio | 纯 Rust 手写(结构简单) | M2 |
+
+> **M2 对拍语义(2026-10-31 实测 7z,fixture `t.deb`/`t.rpm`)**:
+> `deb` → 单条 `data.tar`(取 `data.tar.*` 成员并按内层压缩解压、剥扩展名;`debian-binary`/`control.tar.*` 不暴露);
+> `rpm` → 单条 `{N-V-R.arch}.cpio`(payload 解压为 cpio 流,不二次展开);
+> `ar` → 全部成员原样;`cpio`/`iso` → 目录树原样(目录条目矩阵中忽略)。
+
 | L3 接 crate | lzma 单流(.lzma)、lzip(.lz)、lz4、bzip3、iso9660(.iso) | `lzma-rust2`/`iso9660`/`lz4`/`bzip3` crate | M2 |
 | L4 spec 重写 | udf、chm | 按公开规范纯 Rust 实现 | **Backlog 再议**(2026-10-30:需求弱,不排期) |
 | L5 音频容器 | flac(`claxon`)、ape(`mac`)、shn(`shorten`) | crate 接入,只读 | M3 |
