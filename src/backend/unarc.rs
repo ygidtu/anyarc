@@ -1,12 +1,14 @@
-//! unarc-rs 封装:单卷 / 分卷统一打开,类型擦除。
+//! unarc-rs 封装:单卷 / 分卷统一打开,类型擦除,输出解耦的 Entry 模型。
 
 use std::fs::File;
 use std::io::{BufReader, Read, Seek};
 use std::path::{Path, PathBuf};
 
-use unarc_rs::unified::{ArchiveEntry, ArchiveFormat, ArchiveOptions, UnifiedArchive, VolumeProvider};
+use unarc_rs::EncryptionMethod;
+use unarc_rs::date_time::DosDateTime;
+use unarc_rs::unified::{ArchiveEntry, ArchiveEntryKind, ArchiveFormat, ArchiveOptions, UnifiedArchive, VolumeProvider};
 
-use crate::backend::{ArchiveBackend, OpenOptions};
+use crate::backend::{ArchiveBackend, Entry, EntryKind, Format, OpenOptions};
 use crate::detect::{Backlog, Detected, Known};
 
 /// 把不同 Reader 单态化的 UnifiedArchive 擦成统一 trait object。
@@ -34,26 +36,62 @@ impl<T: Read + Seek> UnifiedOps for UnifiedArchive<T> {
 
 pub struct UnarcBackend {
     inner: Box<dyn UnifiedOps>,
-}
-
-/// 条目名归一化:ArchiveEntry.name 不可变,统一在出口处做 `\` → `/`。
-pub fn entry_name(entry: &ArchiveEntry) -> String {
-    entry.name().replace('\\', "/")
+    current: Option<ArchiveEntry>,
 }
 
 impl ArchiveBackend for UnarcBackend {
-    fn format(&self) -> ArchiveFormat {
-        self.inner.format()
+    fn format(&self) -> Format {
+        Format::Unarc(self.inner.format())
     }
-    fn next_entry(&mut self) -> anyhow::Result<Option<ArchiveEntry>> {
-        self.inner.next().map_err(|e| anyhow::anyhow!("{e}"))
+    fn next_entry(&mut self) -> anyhow::Result<Option<Entry>> {
+        let e = self.inner.next().map_err(|e| anyhow::anyhow!("{e}"))?;
+        Ok(e.map(|e| {
+            let out = to_entry(&e);
+            self.current = Some(e);
+            out
+        }))
     }
-    fn read(&mut self, entry: &ArchiveEntry) -> anyhow::Result<Vec<u8>> {
-        self.inner.read(entry).map_err(|e| anyhow::anyhow!("{e}"))
+    fn read_current(&mut self) -> anyhow::Result<Vec<u8>> {
+        let e = self.current.take().ok_or_else(|| anyhow::anyhow!("无当前条目(先 next_entry)"))?;
+        self.inner.read(&e).map_err(|e| anyhow::anyhow!("{e}"))
     }
-    fn skip(&mut self, entry: &ArchiveEntry) -> anyhow::Result<()> {
-        self.inner.skip(entry).map_err(|e| anyhow::anyhow!("{e}"))
+    fn skip_current(&mut self) -> anyhow::Result<()> {
+        let e = self.current.take().ok_or_else(|| anyhow::anyhow!("无当前条目(先 next_entry)"))?;
+        self.inner.skip(&e).map_err(|e| anyhow::anyhow!("{e}"))
     }
+}
+
+/// ArchiveEntry → 解耦 Entry(名字归一化 `\`→`/`,加密标志合并)。
+fn to_entry(e: &ArchiveEntry) -> Entry {
+    Entry {
+        name: e.name().replace('\\', "/"),
+        kind: match e.kind() {
+            ArchiveEntryKind::File => EntryKind::File,
+            ArchiveEntryKind::Directory => EntryKind::Directory,
+            ArchiveEntryKind::SymbolicLink => EntryKind::Symlink,
+            ArchiveEntryKind::HardLink => EntryKind::HardLink,
+            ArchiveEntryKind::Special | ArchiveEntryKind::Unknown => EntryKind::Special,
+        },
+        size: e.original_size(),
+        compressed_size: e.compressed_size(),
+        method: e.compression_method().to_string(),
+        mtime_epoch: e.modified_time().map(dos_epoch),
+        encrypted: e.encryption() != EncryptionMethod::None,
+        link_target: e.link_target().map(|t| t.replace('\\', "/")),
+    }
+}
+
+/// DOS 时间戳 → Unix epoch 秒(公历换算,无外部依赖)。
+fn dos_epoch(d: DosDateTime) -> u64 {
+    let (mut y, m, dd) = (i64::from(d.year()), i64::from(d.month()), i64::from(d.day()));
+    // days_from_civil Howard Hinnant
+    y -= i64::from(m <= 2);
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400;
+    let doy = 153 * (i64::from(m) + if m > 2 { -3 } else { 9 }) + 2;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy / 5 + i64::from(dd) - 1;
+    let days = era * 146097 + doe - 719468;
+    (days as u64) * 86400 + u64::from(d.hour()) * 3600 + u64::from(d.minute()) * 60 + u64::from(d.second())
 }
 
 fn to_opts(opts: &OpenOptions) -> ArchiveOptions {
@@ -140,6 +178,7 @@ pub fn open(path: &Path, det: &Detected, opts: &OpenOptions) -> anyhow::Result<B
                 "检测到 {name} 格式,当前版本不支持解压(已列入 Backlog)。建议:7-Zip / 官方工具可处理此档案"
             );
         }
+        Known::Container(_) => unreachable!("容器格式由 container 模块打开"),
     };
 
     // 分卷:7z .001/.002… 与 zip .zip/.z01…
@@ -147,14 +186,14 @@ pub fn open(path: &Path, det: &Detected, opts: &OpenOptions) -> anyhow::Result<B
         if let Some(vols) = collect_7z_volumes(path) {
             let a = ArchiveFormat::open_multi_volume_7z(&vols, to_opts(opts))
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
-            return Ok(Box::new(UnarcBackend { inner: boxed(a) }));
+            return Ok(Box::new(UnarcBackend { inner: boxed(a), current: None }));
         }
     }
     if kind == ArchiveFormat::Zip {
         if let Some(vols) = collect_zip_volumes(path) {
             let a = ArchiveFormat::open_multi_volume_zip(&vols, to_opts(opts))
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
-            return Ok(Box::new(UnarcBackend { inner: boxed(a) }));
+            return Ok(Box::new(UnarcBackend { inner: boxed(a), current: None }));
         }
     }
 
@@ -171,7 +210,7 @@ pub fn open(path: &Path, det: &Detected, opts: &OpenOptions) -> anyhow::Result<B
     if let Some(n) = &opts.single_file_name {
         a.set_single_file_name(n.clone());
     }
-    Ok(Box::new(UnarcBackend { inner: boxed(a) }))
+    Ok(Box::new(UnarcBackend { inner: boxed(a), current: None }))
 }
 
 fn boxed<T: Read + Seek + 'static>(a: UnifiedArchive<T>) -> Box<dyn UnifiedOps> {
@@ -254,5 +293,12 @@ mod tests {
         assert_eq!(s, "t");
         let (_, s) = split_dir_stem(Path::new("/x/t.cb7.foo")).unwrap();
         assert_eq!(s, "t.cb7");
+    }
+
+    #[test]
+    fn dos_epoch_conversion() {
+        // 2010-02-19 06:49:xx DOS → epoch 1266562140+
+        let d = DosDateTime::new(((2010 - 1980) << 25) | (2 << 21) | (19 << 16) | (6 << 11) | (49 << 5) | 0);
+        assert_eq!(dos_epoch(d), 1266562140);
     }
 }

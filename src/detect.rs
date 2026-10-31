@@ -35,7 +35,19 @@ pub enum Backlog {
 pub enum Known {
     /// 可由 unarc-rs 后端打开;`ArchiveFormat` 即打开时传入的格式。
     Unarc(ArchiveFormat),
+    /// M2 自写容器后端
+    Container(Container),
     Backlog(Backlog),
+}
+
+/// 自写容器格式(M2)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Container {
+    Ar,
+    Deb,
+    Rpm,
+    Cpio,
+    Iso,
 }
 
 /// 探测结果。`prefix_bytes` 仅对 Zip 有意义:zip 体前的junk 数据长度
@@ -53,14 +65,52 @@ const ZIP64_EOCD_LOCATOR_MAGIC: &[u8; 4] = b"PK\x06\x07";
 
 /// 探测一个文件。返回 None = 无法识别。
 pub fn detect(path: &Path) -> std::io::Result<Option<Detected>> {
+    if path.is_dir() {
+        return Ok(None); // 目录不是归档(patool 行为一致:报“无法识别”)
+    }
     let mut file = File::open(path)?;
 
     // 0) FreeArc magic 守卫:经典 ARC 首字节是 0x1A,FreeArc 是 "ArC\x01"。
     //    unarc-rs 0.8.1 无 FreeArc 后端,若按 .arc 扩展名路由会进错解码器。
     file.seek(SeekFrom::Start(0))?;
-    let mut head = [0u8; 4];
-    if file.read_exact(&mut head).is_ok() && &head == b"ArC\x01" {
+    let mut head = [0u8; 16];
+    let hn = file.read(&mut head).unwrap_or(0);
+    let head = &head[..hn];
+    if head.starts_with(b"ArC\x01") {
         return Ok(Some(Detected { kind: Known::Backlog(Backlog::FreeArc), prefix_bytes: 0 }));
+    }
+
+    // 0.5) M2 自写容器 magic(优先于 unarc:这些格式 unarc 本就无后端)
+    if head.starts_with(b"!<arch>\n") {
+        let c = if path_extension(path).as_deref() == Some("deb") { Container::Deb } else { Container::Ar };
+        return Ok(Some(Detected { kind: Known::Container(c), prefix_bytes: 0 }));
+    }
+    if head.starts_with(b"\xed\xab\xee\xdb") {
+        return Ok(Some(Detected { kind: Known::Container(Container::Rpm), prefix_bytes: 0 }));
+    }
+    if head.starts_with(b"070701") || head.starts_with(b"070702") {
+        return Ok(Some(Detected { kind: Known::Container(Container::Cpio), prefix_bytes: 0 }));
+    }
+    // 二进制 cpio:0707(bin)/ 070707(hpbin),LE/BE 四种字节序
+    if matches!(head, [0xC7, 0x01, ..] | [0x01, 0xC7, ..] | [0xC7, 0x71, ..] | [0x71, 0xC7, ..]) {
+        return Ok(Some(Detected { kind: Known::Container(Container::Cpio), prefix_bytes: 0 }));
+    }
+    let len = file.seek(SeekFrom::End(0))?;
+    if len >= 32774 {
+        file.seek(SeekFrom::Start(32769))?;
+        let mut sig = [0u8; 5];
+        if file.read_exact(&mut sig).is_ok() && &sig == b"CD001" {
+            // 混合介质(ISO9660+UDF):7z 优先按 Udf 解析(名字大小写/条目都可能不同),
+            // 检测到 UDF 锚点则路由 Backlog,避免 ISO 解析给出错误名字。
+            if udf_anchor(&mut file, len)? {
+                return Ok(Some(Detected { kind: Known::Backlog(Backlog::Udf), prefix_bytes: 0 }));
+            }
+            return Ok(Some(Detected { kind: Known::Container(Container::Iso), prefix_bytes: 0 }));
+        }
+    }
+    // 纯 UDF(无 CD001):标准锚点同样路由 Backlog
+    if udf_anchor(&mut file, len)? {
+        return Ok(Some(Detected { kind: Known::Backlog(Backlog::Udf), prefix_bytes: 0 }));
     }
     file.seek(SeekFrom::Start(0))?;
 
@@ -74,6 +124,7 @@ pub fn detect(path: &Path) -> std::io::Result<Option<Detected>> {
 
     let base = match (hinted, by_ext) {
         (Some(Known::Unarc(f)), _) => Some(Known::Unarc(f)),
+        (Some(k @ Known::Container(_)), _) => Some(k),
         (Some(k @ Known::Backlog(_)), _) => Some(k),
         (None, Some(k)) => Some(k),
         (None, None) => None,
@@ -135,15 +186,22 @@ fn ext_hint(path: &Path) -> Option<Known> {
         "udf" => Known::Backlog(Backlog::Udf),
         "chm" => Known::Backlog(Backlog::Chm),
         "lzma" => Known::Backlog(Backlog::LzmaAlone),
-        // M2 计划自写解析的容器:给出明确错误而非"无法识别"
-        "cpio" => Known::Backlog(Backlog::Planned("cpio 归档")),
-        "iso" => Known::Backlog(Backlog::Planned("ISO 9660 镜像")),
-        "deb" => Known::Backlog(Backlog::Planned("Debian 包(ar 容器)")),
-        "rpm" => Known::Backlog(Backlog::Planned("RPM 包")),
-        "ar" | "a" => Known::Backlog(Backlog::Planned("ar 归档(Unix 静态库)")),
+        // 自写容器(M2)
+        "cpio" => Known::Container(Container::Cpio),
+        "iso" => Known::Container(Container::Iso),
+        "deb" => Known::Container(Container::Deb),
+        "rpm" => Known::Container(Container::Rpm),
+        "ar" | "a" => Known::Container(Container::Ar),
         _ => return None,
     };
     Some(k)
+}
+
+/// 小写扩展名(去 patool 的 .foo 伪装后缀)。
+fn path_extension(path: &Path) -> Option<String> {
+    let name = path.file_name()?.to_str()?.to_lowercase();
+    let name = name.strip_suffix(".foo").unwrap_or(&name);
+    Some(name.rsplit('.').next()?.to_string())
 }
 
 /// 单流压缩格式 → 若解压后首块是合法 tar header,改写为对应复合格式。
@@ -259,6 +317,30 @@ fn tar_checksum_matches(block: &[u8]) -> bool {
 
 /// 尾部反扫 EOCD,返回 zip 体前置字节数(0 = 无前置数据,不触发)。
 /// 校验:EOCD 的 CD 条目数/偏移/大小自洽;可选再校验 CD 签名。
+/// UDF 锚点探测:标准 AVDP(AnchorString `BEA01VRS` @ LBA256/512 描述符 +16),
+/// 或混合介质 ECMA-167 2/2.7 内嵌指针(genisoimage -udf:LBA18/19 处 `BEA01`/`NSR02`)。
+fn udf_anchor(file: &mut File, len: u64) -> std::io::Result<bool> {
+    const SEC: u64 = 2048;
+    let mut at = |off: u64, want: &[u8]| -> std::io::Result<bool> {
+        if off.checked_add(want.len() as u64).is_none_or(|e| e > len) {
+            return Ok(false);
+        }
+        file.seek(SeekFrom::Start(off))?;
+        let mut b = vec![0u8; want.len()];
+        if file.read_exact(&mut b).is_err() {
+            return Ok(false);
+        }
+        Ok(b == want)
+    };
+    if at(256 * SEC + 16, b"BEA01VRS")? || at(512 * SEC + 16, b"BEA01VRS")? {
+        return Ok(true);
+    }
+    if at(18 * SEC + 1, b"BEA01")? && at(19 * SEC + 1, b"NSR02")? {
+        return Ok(true);
+    }
+    Ok(false)
+}
+
 pub fn eocd_scan(file: &mut File) -> std::io::Result<Option<u64>> {
     let len = file.seek(SeekFrom::End(0))?;
     if len < 22 {

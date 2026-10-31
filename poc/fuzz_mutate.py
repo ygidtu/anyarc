@@ -18,6 +18,8 @@ SUPPORTED = [
     "t.txt.Z", "t.arc", "t.arj", "p.arj", "t.lha", "t.lzh", "t.zoo", "t.cab",
     "t.ace", "t.cba", "t.adf", "t.hdf", "t.dms", "t.jar", "t.epub", "t.apk",
     "t.cbz", "t.cb7", "t.cbt", "t.lynx", "t.sq", "t.uc2", "t.ice", "t.hyp",
+    # M2 自写容器(手写解析器必须吃 fuzz)
+    "t.deb", "t.rpm", "t.cpio", "t.iso", "t.txt.a",
 ]
 N = int(sys.argv[1]) if len(sys.argv) > 1 else 200
 random.seed(20261031)

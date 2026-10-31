@@ -2,13 +2,11 @@ use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 
 use clap::Parser;
-use unarc_rs::date_time::DosDateTime;
 use unarc_rs::unified::ArchiveFormat;
 
-use crate::backend::{self, ArchiveBackend, OpenOptions, entry_encrypted};
+use crate::backend::{self, ArchiveBackend, EntryKind, Format, OpenOptions};
 use crate::detect;
-use crate::detect::{Detected, Known};
-use crate::extract::{Action, classify, is_tty, link_target_escapes, safe_join};
+use crate::extract::{link_target_escapes, safe_join};
 
 // ---------------------------------------------------------------- CLI
 
@@ -92,24 +90,22 @@ pub struct ListArgs {
 // ---------------------------------------------------------------- 公共流程
 
 /// 探测 + 告警(偏移 zip)。
-fn detect_with_warning(path: &Path, quiet: bool) -> anyhow::Result<Detected> {
+fn detect_with_warning(path: &Path, quiet: bool) -> anyhow::Result<detect::Detected> {
     let det = detect::detect(path)
         .map_err(|e| anyhow::anyhow!("探测失败 {}: {e}", path.display()))?
         .ok_or_else(|| anyhow::anyhow!("无法识别归档格式: {}", path.display()))?;
-    if let Known::Unarc(_) = det.kind {
-        if det.prefix_bytes > 0 && !quiet {
-            eprintln!(
-                "检测到 {} 字节前置数据(疑似伪装/SFX),条目名偏移已自动修正: {}",
-                det.prefix_bytes,
-                path.display()
-            );
-        }
+    if matches!(det.kind, detect::Known::Unarc(_)) && det.prefix_bytes > 0 && !quiet {
+        eprintln!(
+            "检测到 {} 字节前置数据(疑似伪装/SFX),条目名偏移已自动修正: {}",
+            det.prefix_bytes,
+            path.display()
+        );
     }
     Ok(det)
 }
 
 /// 打开归档;若含加密条目且无密码,交互式获取并做探针验证。
-pub fn open_verified(path: &Path, det: &Detected, common: &CommonArgs) -> anyhow::Result<Box<dyn ArchiveBackend>> {
+pub fn open_verified(path: &Path, det: &detect::Detected, common: &CommonArgs) -> anyhow::Result<Box<dyn ArchiveBackend>> {
     let mut opts = open_opts(common, path);
     let mut ar = backend::open(path, det, &opts)?;
 
@@ -139,11 +135,12 @@ pub fn open_verified(path: &Path, det: &Detected, common: &CommonArgs) -> anyhow
             }
             opts.password = Some(p);
         }
-        // 探针:重开 + 读最小加密条目(CRC 校验)
+        // 探针:重开 + 顺序就地读第一个加密条目(CRC 校验)
         match probe_password(path, det, &opts) {
             Ok(()) => return Ok(reopen(path, det, &opts)?),
             Err(e) => {
                 if explicit {
+                    let _ = e;
                     return Err(anyhow::anyhow!("密码错误(解密校验失败)"));
                 }
                 if attempts >= 3 {
@@ -200,36 +197,31 @@ fn single_target_name(path: &Path, _f: ArchiveFormat) -> Option<String> {
 }
 
 fn scan_encrypted(ar: &mut dyn ArchiveBackend) -> anyhow::Result<bool> {
-    let mut found = false;
     while let Some(e) = ar.next_entry()? {
-        if entry_encrypted(&e) {
-            found = true;
+        if e.encrypted {
+            return Ok(true);
         }
-        ar.skip(&e)?;
-        if found {
-            break;
-        }
+        ar.skip_current()?;
     }
-    Ok(found)
+    Ok(false)
 }
 
-fn reopen(path: &Path, det: &Detected, opts: &OpenOptions) -> anyhow::Result<Box<dyn ArchiveBackend>> {
+fn reopen(path: &Path, det: &detect::Detected, opts: &OpenOptions) -> anyhow::Result<Box<dyn ArchiveBackend>> {
     backend::open(path, det, opts)
 }
 
-/// 密码探针:重新打开并完整读最小加密条目(CRC 校验)。
-fn probe_password(path: &Path, det: &Detected, opts: &OpenOptions) -> anyhow::Result<()> {
+/// 密码探针:重新打开并顺序就地读第一个 <1MiB 加密条目(CRC 校验)。
+/// 不能"记录候选稍后再读":ARJ 等顺序流后端 skip 过位置后无法回读。
+fn probe_password(path: &Path, det: &detect::Detected, opts: &OpenOptions) -> anyhow::Result<()> {
     let mut probe_opts = opts.clone();
     probe_opts.verify_crc = true;
     let mut ar = reopen(path, det, &probe_opts)?;
-    // 顺序就地读**第一个** <1MiB 的加密条目。
-    // 不能"记录候选稍后再读":ARJ 等顺序流后端 skip 过位置后无法回读。
     while let Some(e) = ar.next_entry()? {
-        if entry_encrypted(&e) && e.original_size() < 1 << 20 {
-            ar.read(&e)?; // 错误密码 → 解密/CRC 失败
+        if e.encrypted && e.size < 1 << 20 {
+            ar.read_current()?; // 错误密码 → 解密/CRC 失败
             return Ok(());
         }
-        ar.skip(&e)?;
+        ar.skip_current()?;
     }
     Ok(())
 }
@@ -272,19 +264,19 @@ fn extract_one(
 ) -> anyhow::Result<()> {
     let dest = &args.out;
     std::fs::create_dir_all(dest)?;
-    let fmt = ar.format();
-    let single = is_single_stream(fmt);
+    let single = matches!(ar.format(), Format::Unarc(f) if is_single_stream(f));
     let mut n_file = 0usize;
     let mut n_dir = 0usize;
     let mut n_skipped = 0usize;
     let mut n_overwrite_skip = 0usize;
-    let show_progress = is_tty() && !args.common.quiet;
+    let show_progress = crate::extract::is_tty() && !args.common.quiet;
+    let mut seq = 0usize;
 
     while let Some(entry) = ar.next_entry()? {
-        let raw_name = crate::backend::unarc::entry_name(&entry);
-        let name = fixed_name(&raw_name, enc);
-        match classify(entry.kind()) {
-            Action::Dir => {
+        seq += 1;
+        let name = fixed_name(&entry.name, enc);
+        match entry.kind {
+            EntryKind::Directory => {
                 if let Some(p) = safe_join(dest, &name) {
                     if !single {
                         std::fs::create_dir_all(&p)?;
@@ -293,48 +285,47 @@ fn extract_one(
                 } else {
                     n_skipped += 1;
                 }
-                ar.skip(&entry)?;
+                ar.skip_current()?;
             }
-            Action::File => {
+            EntryKind::File => {
                 let Some(p) = safe_join(dest, &name) else {
                     n_skipped += 1;
-                    ar.skip(&entry)?;
+                    ar.skip_current()?;
                     continue;
                 };
                 if p.exists() && !args.common.overwrite {
                     n_overwrite_skip += 1;
-                    ar.skip(&entry)?;
+                    ar.skip_current()?;
                     continue;
                 }
                 if show_progress {
-                    eprint!("\r解压: {name}");
+                    eprint!("\r解压 [{seq}]: {name}");
                 }
-                let data = ar.read(&entry)?; // read 后条目已消费,无需 skip
+                let data = ar.read_current()?; // 读后条目已消费
                 if let Some(parent) = p.parent() {
                     std::fs::create_dir_all(parent)?;
                 }
                 std::fs::write(&p, &data)?;
                 n_file += 1;
             }
-            Action::Symlink => {
-                let Some(target) = entry.link_target() else {
+            EntryKind::Symlink => {
+                let Some(target) = entry.link_target else {
                     n_skipped += 1;
-                    ar.skip(&entry)?;
+                    ar.skip_current()?;
                     continue;
                 };
                 let Some(p) = safe_join(dest, &name) else {
                     n_skipped += 1;
-                    ar.skip(&entry)?;
+                    ar.skip_current()?;
                     continue;
                 };
-                let target = target.replace('\\', "/");
                 if let Some(parent) = p.parent() {
                     std::fs::create_dir_all(parent)?;
                 }
                 if link_target_escapes(dest, p.parent().unwrap_or(dest), &target) {
                     eprintln!("警告: 符号链接逃逸已跳过: {name} -> {target}");
                     n_skipped += 1;
-                    ar.skip(&entry)?;
+                    ar.skip_current()?;
                     continue;
                 }
                 #[cfg(unix)]
@@ -347,30 +338,30 @@ fn extract_one(
                     let _ = target;
                     n_skipped += 1;
                 }
-                ar.skip(&entry)?;
+                ar.skip_current()?;
             }
-            Action::Hardlink => {
-                // M1:硬链接条目按"读内容写文件"降级(保持可读性),M2 换真硬链接
+            EntryKind::HardLink => {
+                // M1:硬链接条目按"读内容写文件"降级(保持可读性),后续换真硬链接
                 let Some(p) = safe_join(dest, &name) else {
                     n_skipped += 1;
-                    ar.skip(&entry)?;
+                    ar.skip_current()?;
                     continue;
                 };
                 if p.exists() && !args.common.overwrite {
                     n_overwrite_skip += 1;
-                    ar.skip(&entry)?;
+                    ar.skip_current()?;
                     continue;
                 }
-                let data = ar.read(&entry)?;
+                let data = ar.read_current()?;
                 if let Some(parent) = p.parent() {
                     std::fs::create_dir_all(parent)?;
                 }
                 std::fs::write(&p, &data)?;
                 n_file += 1;
             }
-            Action::SkipSpecial => {
+            EntryKind::Special => {
                 n_skipped += 1;
-                ar.skip(&entry)?;
+                ar.skip_current()?;
             }
         }
     }
@@ -391,20 +382,17 @@ pub fn cmd_test(args: &TestArgs) -> anyhow::Result<u8> {
     for path in &args.common.archives {
         let det = detect_with_warning(path, args.common.quiet)?;
         let mut ar = open_verified(path, &det, &args.common)?;
-        let mut n = 0usize;
         match test_one(ar.as_mut()) {
             Ok(files) => {
                 if !args.common.quiet {
                     println!("OK: {} ({files} 个条目全部解码+CRC校验通过)", path.display());
                 }
-                n = files;
             }
             Err(e) => {
                 eprintln!("错误: {}: {e:#}", path.display());
                 failures += 1;
             }
         }
-        let _ = n;
     }
     Ok(if failures == 0 { 0 } else { 1 })
 }
@@ -412,11 +400,11 @@ pub fn cmd_test(args: &TestArgs) -> anyhow::Result<u8> {
 fn test_one(ar: &mut dyn ArchiveBackend) -> anyhow::Result<usize> {
     let mut files = 0usize;
     while let Some(e) = ar.next_entry()? {
-        if e.is_directory() {
-            ar.skip(&e)?;
+        if e.kind == EntryKind::Directory {
+            ar.skip_current()?;
             continue;
         }
-        ar.read(&e)?;
+        ar.read_current()?;
         files += 1;
     }
     Ok(files)
@@ -432,7 +420,7 @@ pub fn cmd_list(args: &ListArgs) -> anyhow::Result<u8> {
         }
         let mut first = true;
         while let Some(e) = ar.next_entry()? {
-            let name = fixed_name(&crate::backend::unarc::entry_name(&e), enc);
+            let name = fixed_name(&e.name, enc);
             if args.json {
                 if !first {
                     println!(",");
@@ -441,24 +429,26 @@ pub fn cmd_list(args: &ListArgs) -> anyhow::Result<u8> {
                 print!(
                     "  {{\"name\":\"{}\",\"kind\":\"{}\",\"size\":{},\"encrypted\":{}{}",
                     json_escape(&name),
-                    kind_str(e.kind()),
-                    e.original_size(),
-                    entry_encrypted(&e),
-                    time_json(e.modified_time())
+                    kind_str(e.kind),
+                    e.size,
+                    e.encrypted,
+                    time_json(e.mtime_epoch)
                 );
             } else if args.long {
+                // 解压后尺寸未知(deb/rpm 内嵌压缩流)时退显 packed 尺寸
+                let shown = if e.size > 0 { e.size } else { e.compressed_size };
                 println!(
                     "{:>10}  {}  {:<10} {}{}",
-                    e.original_size(),
-                    time_str(e.modified_time()),
-                    e.compression_method(),
-                    if entry_encrypted(&e) { "*" } else { " " },
+                    shown,
+                    time_str(e.mtime_epoch),
+                    e.method,
+                    if e.encrypted { "*" } else { " " },
                     name
                 );
             } else {
                 println!("{name}");
             }
-            ar.skip(&e)?;
+            ar.skip_current()?;
         }
         if args.json {
             println!("\n]}}");
@@ -467,27 +457,49 @@ pub fn cmd_list(args: &ListArgs) -> anyhow::Result<u8> {
     Ok(0)
 }
 
-fn kind_str(k: unarc_rs::unified::ArchiveEntryKind) -> &'static str {
+fn kind_str(k: EntryKind) -> &'static str {
     match k {
-        unarc_rs::unified::ArchiveEntryKind::File => "file",
-        unarc_rs::unified::ArchiveEntryKind::Directory => "dir",
-        unarc_rs::unified::ArchiveEntryKind::SymbolicLink => "symlink",
-        unarc_rs::unified::ArchiveEntryKind::HardLink => "hardlink",
-        unarc_rs::unified::ArchiveEntryKind::Special => "special",
-        unarc_rs::unified::ArchiveEntryKind::Unknown => "unknown",
+        EntryKind::File => "file",
+        EntryKind::Directory => "dir",
+        EntryKind::Symlink => "symlink",
+        EntryKind::HardLink => "hardlink",
+        EntryKind::Special => "special",
     }
 }
 
-fn time_str(t: Option<DosDateTime>) -> String {
+/// epoch → UTC 日历(Howard Hinnant civil_from_days)。
+fn epoch_civil(e: u64) -> (i64, u32, u32, u32, u32, u32) {
+    let days = (e / 86400) as i64;
+    let sod = e % 86400;
+    let z = days + 719468;
+    let era = if z >= 0 { z } else { z - 146096 } / 146097;
+    let doe = z - era * 146097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
+    let y = if m <= 2 { y + 1 } else { y };
+    (y, m, d, (sod / 3600) as u32, (sod % 3600 / 60) as u32, (sod % 60) as u32)
+}
+
+fn time_str(t: Option<u64>) -> String {
     match t {
-        Some(d) => format!("{:04}-{:02}-{:02} {:02}:{:02}", d.year(), d.month(), d.day(), d.hour(), d.minute()),
+        Some(e) => {
+            let (y, m, d, hh, mm, _) = epoch_civil(e);
+            format!("{y:04}-{m:02}-{d:02} {hh:02}:{mm:02}")
+        }
         None => "-".to_string(),
     }
 }
 
-fn time_json(t: Option<DosDateTime>) -> String {
+fn time_json(t: Option<u64>) -> String {
     match t {
-        Some(d) => format!(",\"mtime\":\"{:04}-{:02}-{:02}T{:02}:{:02}:{:02}\"", d.year(), d.month(), d.day(), d.hour(), d.minute(), d.second()),
+        Some(e) => {
+            let (y, m, d, hh, mm, ss) = epoch_civil(e);
+            format!(",\"mtime\":\"{y:04}-{m:02}-{d:02}T{hh:02}:{mm:02}:{ss:02}\"")
+        }
         None => String::new(),
     }
 }
@@ -505,16 +517,16 @@ pub fn cmd_formats() -> anyhow::Result<u8> {
     // 与 detect 的兜底/黑名单保持一致的能力表
     const ROWS: &[(&str, &str, &str)] = &[
         ("zip jar apk epub cbz xpi odt", "read", "含前置数据 zip(SFX/polyglot)、分卷 .z01、WinZip AES-99、ZipCrypto"),
-        ("rar cbr", "read", "RAR4;含密码;多卷 M1 后续"),
+        ("rar cbr", "read", "RAR4/RAR5;含密码;分卷 .rNN/.partNNN 自动聚合"),
         ("7z cb7 001", "read", "含 AES 头加密、分卷 .00N"),
         ("tar tgz taz tbz2 txz tzst tar.* cbt", "read", "全部 tar 家族"),
         ("gz bz2 xz zst Z", "read", "单流压缩"),
-        ("arc arj zoo lha lzh", "read", "BBS 复古格式"),
+        ("arc arj zoo lha lzh", "read", "BBS 复古格式(arj 分卷 .aNN 支持)"),
         ("cab", "read", "MS Cabinet"),
-        ("ace cba", "read", "无外部参照,已自检(真实语料验证中)"),
+        ("ace cba", "read", "无外部参照,变异 fuzz 通过"),
         ("adf hdf dms", "read", "Amiga 镜像"),
+        ("a deb rpm cpio iso", "read", "自写容器;deb=data.tar,rpm=payload.cpio,iso=9660/Joliet"),
         ("freearc alz zpaq shar vhd wim udf chm lzma", "检测但不支持", "Backlog 再议;报错并给指引"),
-        ("a deb rpm cpio iso", "计划中", "M2 自写容器/crate"),
     ];
     println!("{:<44} {:<14} 说明", "扩展名", "能力");
     for (ext, cap, note) in ROWS {

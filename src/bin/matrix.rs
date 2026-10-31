@@ -6,7 +6,7 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use anyarc::backend::{self, OpenOptions, entry_encrypted, entry_name};
+use anyarc::backend::{self, EntryKind, OpenOptions};
 use anyarc::detect::{self, Known};
 
 fn data_dir() -> PathBuf {
@@ -57,22 +57,20 @@ fn load_ref(key: &str) -> Option<Entries> {
 /// 用 anyarc 管线完整读取一个 fixture
 fn run(path: &Path, key: &str) -> anyhow::Result<(String, Entries, usize, bool)> {
     let det = detect::detect(path)?.context("detect: 未知格式")?;
-    let Known::Unarc(_) = det.kind else {
+    if matches!(det.kind, Known::Backlog(_)) {
         anyhow::bail!("Backlog 格式(按预期不支持)");
-    };
+    }
     let mut opts = OpenOptions {
         password: if is_pw(key) { Some(PASS.to_string()) } else { None },
         single_file_name: None,
         ..Default::default()
     };
     // 单流格式:探测结果若为 Gz/Bz2/…(未触发二跳)则设目标名
-    let f = match det.kind {
-        Known::Unarc(f) => f,
-        _ => unreachable!(),
-    };
-    use unarc_rs::unified::ArchiveFormat as Af;
-    if matches!(f, Af::Gz | Af::Bz2 | Af::Xz | Af::Zst | Af::Z) {
-        opts.single_file_name = Some(single_name(key));
+    if let Known::Unarc(f) = det.kind {
+        use unarc_rs::unified::ArchiveFormat as Af;
+        if matches!(f, Af::Gz | Af::Bz2 | Af::Xz | Af::Zst | Af::Z) {
+            opts.single_file_name = Some(single_name(key));
+        }
     }
     let mut ar = backend::open(path, &det, &opts)?;
     let fmt = ar.format().name().to_string();
@@ -80,16 +78,16 @@ fn run(path: &Path, key: &str) -> anyhow::Result<(String, Entries, usize, bool)>
     let mut dirs = 0usize;
     let mut sniff_ok = true;
     while let Some(e) = ar.next_entry()? {
-        if e.is_directory() {
+        if e.kind == EntryKind::Directory {
             dirs += 1;
-            ar.skip(&e)?;
+            ar.skip_current()?;
             continue;
         }
-        let data = ar.read(&e).with_context(|| format!("read {}", entry_name(&e)))?;
-        if entry_name(&e).ends_with(".txt") && !data.starts_with(b"42") {
+        let data = ar.read_current().with_context(|| format!("read {}", e.name))?;
+        if e.name.ends_with(".txt") && !data.starts_with(b"42") {
             sniff_ok = false;
         }
-        entries.insert(entry_name(&e), hexsha(&data));
+        entries.insert(e.name.clone(), hexsha(&data));
     }
     Ok((fmt, entries, dirs, sniff_ok))
 }
@@ -173,5 +171,4 @@ fn main() {
         println!("| {name} | {fmt} | {status} | {detail} |");
     }
     println!("\n总计 {} 个 fixture: MATCH={n_match}, NOREF-OK={n_noref}, MISMATCH={n_mm}, FAIL={n_fail}", files.len());
-    let _ = entry_encrypted;
 }

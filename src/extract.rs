@@ -3,10 +3,6 @@
 use std::io::IsTerminal;
 use std::path::{Component, Path, PathBuf};
 
-use unarc_rs::unified::ArchiveEntryKind;
-
-use crate::backend::EntryKind;
-
 /// 把归档内条目名解析到 dest 下的安全路径。
 /// 拒绝:绝对路径、盘符、`..` 逃逸。返回 None = 应跳过该条目(由调用方计数告警)。
 pub fn safe_join(dest: &Path, name: &str) -> Option<PathBuf> {
@@ -73,24 +69,4 @@ fn lexically_normalize(p: &Path) -> PathBuf {
 
 pub fn is_tty() -> bool {
     std::io::stdout().is_terminal()
-}
-
-/// 条目种类 → 落盘动作分类
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Action {
-    Dir,
-    File,
-    Symlink,
-    Hardlink,
-    SkipSpecial,
-}
-
-pub fn classify(kind: ArchiveEntryKind) -> Action {
-    match kind {
-        EntryKind::Directory => Action::Dir,
-        EntryKind::File => Action::File,
-        EntryKind::SymbolicLink => Action::Symlink,
-        EntryKind::HardLink => Action::Hardlink,
-        EntryKind::Special | EntryKind::Unknown => Action::SkipSpecial,
-    }
 }

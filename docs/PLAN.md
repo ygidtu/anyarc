@@ -92,15 +92,19 @@ pub struct Capabilities { read: bool, write: bool, password: bool, multi_volume:
 | L1 待补验 | ace cba adf dms | unarc-rs(无参照) | 变异 fuzz 10800 次 CRASH=0/TIMEOUT=0(poc/fuzz_mutate.py) |
 | L2 前端修复项 | 无扩展名 tar.gz/tbz/xz/zst、taz 消歧、freearc 误判 | 二跳探测 | M1 |
 | L2 偏移 zip | **带前置数据的 zip**(SFX、伪装成 mp4/exe 的 polyglot 档;`decrypt_zip.py` 场景) | 前端 EOCD 反向扫描(尾部 ≤128KB)→ CD 校验 → 按 Zip 强制打开(后端偏移处理已实测可用);含 WinZip AES-99/ZipCrypto 密码路径 | M1 |
-| L3 自写容器 | a(ar)、deb、rpm、cpio | 纯 Rust 手写(结构简单) | M2 |
+| L3 自写容器 | a(ar)、deb、rpm、cpio(newc+bin/hpbin)、iso9660+Joliet | 纯 Rust 手写(结构简单;iso 不用 GPL C) | **M2-a 完成**(2026-10-31,与 7z 对拍 MATCH) |
 
 > **M2 对拍语义(2026-10-31 实测 7z,fixture `t.deb`/`t.rpm`)**:
 > `deb` → 单条 `data.tar`(取 `data.tar.*` 成员并按内层压缩解压、剥扩展名;`debian-binary`/`control.tar.*` 不暴露);
 > `rpm` → 单条 `{N-V-R.arch}.cpio`(payload 解压为 cpio 流,不二次展开);
 > `ar` → 全部成员原样;`cpio`/`iso` → 目录树原样(目录条目矩阵中忽略)。
 
-| L3 接 crate | lzma 单流(.lzma)、lzip(.lz)、lz4、bzip3、iso9660(.iso) | `lzma-rust2`/`iso9660`/`lz4`/`bzip3` crate | M2 |
-| L4 spec 重写 | udf、chm | 按公开规范纯 Rust 实现 | **Backlog 再议**(2026-10-30:需求弱,不排期) |
+> **M2-a 验收(2026-10-31)**:矩阵 130 fixture:MATCH=77、NOREF-OK=13、MISMATCH=0、FAIL=40(全部为预期 Backlog/未实现);
+> CLI e2e 133 文件:OK=90、拒绝=41、BAD 仅 `p.arc(.foo)`(unarc-rs 上游 ARC 密码 CRC 已知限制);
+> 容器 10 fixture(含 .foo 孪生)全部 MATCH;`t.udf` 经 UDF 锚点探测路由 Backlog。
+
+| L3 接 crate | lzma 单流(.lzma)、lzip(.lz)、lz4、bzip3 | `lzma-rust2`/`lz4`/`bzip3` crate(iso9660 已改手写,M2-a 完成) | M2-b |
+| L4 spec 重写 | udf、chm | 按公开规范纯 Rust 实现 | **Backlog 再议**(2026-10-30:需求弱,不排期)。2026-10-31:混合介质(ISO9660+UDF)已可按标准 AVDP(`BEA01VRS`@LBA256/512)与 genisoimage 内嵌指针(LBA18/19)识别,路由 Backlog 报错而非误走 ISO 解析) |
 | L5 音频容器 | flac(`claxon`)、ape(`mac`)、shn(`shorten`) | crate 接入,只读 | M3 |
 | L6 Backlog | alz(ARK,GPL 冲突)、freearc(codec 许可证差)、zpaq/shar/wav(本就外部工具语义)、vhd/wim(磁盘镜像) | **Backlog 再议**;过渡行为 = 识别格式 + 报错指引 | 不排期 |
 | 永久禁区 | **RAR create** | 无算法/许可证 | 文档明示 |
