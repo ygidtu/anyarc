@@ -222,19 +222,15 @@ fn probe_password(path: &Path, det: &Detected, opts: &OpenOptions) -> anyhow::Re
     let mut probe_opts = opts.clone();
     probe_opts.verify_crc = true;
     let mut ar = reopen(path, det, &probe_opts)?;
-    let mut smallest: Option<(u64, unarc_rs::unified::ArchiveEntry)> = None;
+    // 顺序就地读**第一个** <1MiB 的加密条目。
+    // 不能"记录候选稍后再读":ARJ 等顺序流后端 skip 过位置后无法回读。
     while let Some(e) = ar.next_entry()? {
         if entry_encrypted(&e) && e.original_size() < 1 << 20 {
-            let sz = e.original_size();
-            if smallest.as_ref().map(|(s, _)| sz < *s).unwrap_or(true) {
-                smallest = Some((sz, e));
-                continue;
-            }
+            ar.read(&e)?; // 错误密码 → 解密/CRC 失败
+            return Ok(());
         }
         ar.skip(&e)?;
     }
-    let Some((_, e)) = smallest else { return Ok(()) };
-    ar.read(&e)?; // 错误密码 → CRC/解密失败
     Ok(())
 }
 

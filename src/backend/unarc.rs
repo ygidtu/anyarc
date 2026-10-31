@@ -15,7 +15,6 @@ trait UnifiedOps {
     fn next(&mut self) -> unarc_rs::error::Result<Option<ArchiveEntry>>;
     fn read(&mut self, entry: &ArchiveEntry) -> unarc_rs::error::Result<Vec<u8>>;
     fn skip(&mut self, entry: &ArchiveEntry) -> unarc_rs::error::Result<()>;
-    fn set_single_file_name(&mut self, name: String);
 }
 
 impl<T: Read + Seek> UnifiedOps for UnifiedArchive<T> {
@@ -30,9 +29,6 @@ impl<T: Read + Seek> UnifiedOps for UnifiedArchive<T> {
     }
     fn skip(&mut self, entry: &ArchiveEntry) -> unarc_rs::error::Result<()> {
         self.skip(entry)
-    }
-    fn set_single_file_name(&mut self, name: String) {
-        UnifiedArchive::set_single_file_name(self, name)
     }
 }
 
@@ -85,7 +81,12 @@ pub fn open(path: &Path, det: &Detected, opts: &OpenOptions) -> anyhow::Result<B
                 Backlog::Wim => "WIM 镜像",
                 Backlog::Udf => "UDF 文件系统镜像",
                 Backlog::Chm => "CHM 帮助文档",
-                Backlog::LzmaAlone => "LZMA 单流",
+                Backlog::LzmaAlone => "LZMA 单流(含 .tar.lzma 外层)",
+                Backlog::Planned(what) => {
+                    anyhow::bail!(
+                        "检测到 {what} 格式,当前版本不支持解压(M2 计划自写容器解析)。建议:系统工具(如 ar/rpm/cpio)可处理此档案"
+                    );
+                }
                 Backlog::Other => "未知长尾格式",
             };
             anyhow::bail!(

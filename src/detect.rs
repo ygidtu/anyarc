@@ -26,6 +26,8 @@ pub enum Backlog {
     Udf,
     Chm,
     LzmaAlone,
+    /// M2 计划自写解析的容器(携带展示用标签)
+    Planned(&'static str),
     Other,
 }
 
@@ -52,6 +54,15 @@ const ZIP64_EOCD_LOCATOR_MAGIC: &[u8; 4] = b"PK\x06\x07";
 /// 探测一个文件。返回 None = 无法识别。
 pub fn detect(path: &Path) -> std::io::Result<Option<Detected>> {
     let mut file = File::open(path)?;
+
+    // 0) FreeArc magic 守卫:经典 ARC 首字节是 0x1A,FreeArc 是 "ArC\x01"。
+    //    unarc-rs 0.8.1 无 FreeArc 后端,若按 .arc 扩展名路由会进错解码器。
+    file.seek(SeekFrom::Start(0))?;
+    let mut head = [0u8; 4];
+    if file.read_exact(&mut head).is_ok() && &head == b"ArC\x01" {
+        return Ok(Some(Detected { kind: Known::Backlog(Backlog::FreeArc), prefix_bytes: 0 }));
+    }
+    file.seek(SeekFrom::Start(0))?;
 
     // 1) 内容 magic(路径提示帮助 unarc 内部做 Gz+tgz 之类的合并)
     let hinted = ArchiveFormat::detect(&mut file, Some(path))
@@ -95,7 +106,8 @@ fn ext_hint(path: &Path) -> Option<Known> {
         ("tar.bz2", Known::Unarc(ArchiveFormat::Tbz)),
         ("tar.xz", Known::Unarc(ArchiveFormat::Txz)),
         ("tar.zst", Known::Unarc(ArchiveFormat::Tzst)),
-        ("tar.lzma", Known::Unarc(ArchiveFormat::Txz)), // unarc 的 Txz 兼容 lzma 外层?未知,M2 复核
+        // unarc 0.8.1 无 LZMA-alone 解码路径,Txz 会报 "invalid XZ magic" → 明确 Backlog
+        ("tar.lzma", Known::Backlog(Backlog::LzmaAlone)),
     ];
     for (e, k) in long_exts {
         if name.ends_with(e) {
@@ -123,6 +135,12 @@ fn ext_hint(path: &Path) -> Option<Known> {
         "udf" => Known::Backlog(Backlog::Udf),
         "chm" => Known::Backlog(Backlog::Chm),
         "lzma" => Known::Backlog(Backlog::LzmaAlone),
+        // M2 计划自写解析的容器:给出明确错误而非"无法识别"
+        "cpio" => Known::Backlog(Backlog::Planned("cpio 归档")),
+        "iso" => Known::Backlog(Backlog::Planned("ISO 9660 镜像")),
+        "deb" => Known::Backlog(Backlog::Planned("Debian 包(ar 容器)")),
+        "rpm" => Known::Backlog(Backlog::Planned("RPM 包")),
+        "ar" | "a" => Known::Backlog(Backlog::Planned("ar 归档(Unix 静态库)")),
         _ => return None,
     };
     Some(k)
@@ -261,7 +279,7 @@ pub fn eocd_scan(file: &mut File) -> std::io::Result<Option<u64>> {
             if j + 22 + comment_len == tail.len() {
                 let entries = u16::from_le_bytes([eocd[10], eocd[11]]) as u64;
                 let cd_size = u32::from_le_bytes([eocd[12], eocd[13], eocd[14], eocd[15]]) as u64;
-                let mut cd_off = u32::from_le_bytes([eocd[16], eocd[17], eocd[18], eocd[19]]) as u64;
+                let cd_off = u32::from_le_bytes([eocd[16], eocd[17], eocd[18], eocd[19]]) as u64;
 
                 // ZIP64 哨兵 → 前 20B 找 Locator,再读 ZIP64 EOCD record
                 if (cd_off == 0xFFFFFFFF || entries == 0xFFFF) && j >= 20 {
