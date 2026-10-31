@@ -3,7 +3,7 @@
 # 每行 "<sha256>\t<相对路径>";单文件流格式用解压后文件名。
 set -u
 DATA=/home/zym/code/patool/tests/data
-OUT=/home/zym/code/anyarc/ref
+OUT=/home/zym/code/anyarc/poc/ref
 PASS=thereisnotry
 rm -rf "$OUT"; mkdir -p "$OUT"
 
