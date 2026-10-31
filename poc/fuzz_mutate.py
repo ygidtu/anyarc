@@ -20,6 +20,10 @@ SUPPORTED = [
     "t.cbz", "t.cb7", "t.cbt", "t.lynx", "t.sq", "t.uc2", "t.ice", "t.hyp",
     # M2 自写容器(手写解析器必须吃 fuzz)
     "t.deb", "t.rpm", "t.cpio", "t.iso", "t.txt.a",
+    # M2-b1 单流压缩(lzma-rs/lzma-rust2/lz4_flex + tar 复合)
+    "t.txt.lzma", "t.txt.lzma.foo", "t.tar.lzma", "t.tar.lzma.foo",
+    "t.txt.lz", "t.txt.lz.foo", "t.tar.lz", "t.tar.lz.foo",
+    "t.txt.lz4", "t.txt.lz4.foo",
 ]
 N = int(sys.argv[1]) if len(sys.argv) > 1 else 200
 random.seed(20261031)

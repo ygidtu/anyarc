@@ -112,7 +112,7 @@ pub fn open_verified(path: &Path, det: &detect::Detected, common: &CommonArgs) -
     // 是否含加密条目:先扫一遍条目(全 skip)
     let has_encrypted = scan_encrypted(ar.as_mut())?;
     if !has_encrypted {
-        return Ok(reopen(path, det, &opts)?);
+        return reopen(path, det, &opts);
     }
 
     // 需要密码:CLI → env → tty
@@ -137,7 +137,7 @@ pub fn open_verified(path: &Path, det: &detect::Detected, common: &CommonArgs) -
         }
         // 探针:重开 + 顺序就地读第一个加密条目(CRC 校验)
         match probe_password(path, det, &opts) {
-            Ok(()) => return Ok(reopen(path, det, &opts)?),
+            Ok(()) => return reopen(path, det, &opts),
             Err(e) => {
                 if explicit {
                     let _ = e;

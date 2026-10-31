@@ -26,6 +26,12 @@ pub enum Format {
     Cpio,
     /// ISO 9660
     Iso,
+    /// LZMA-alone 单流
+    LzmaAlone,
+    /// lzip 容器
+    Lzip,
+    /// LZ4 frame
+    Lz4,
 }
 
 impl Format {
@@ -37,6 +43,9 @@ impl Format {
             Format::Rpm => "rpm".into(),
             Format::Cpio => "cpio".into(),
             Format::Iso => "iso".into(),
+            Format::LzmaAlone => "lzma".into(),
+            Format::Lzip => "lzip".into(),
+            Format::Lz4 => "lz4".into(),
         }
     }
 }

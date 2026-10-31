@@ -88,8 +88,8 @@ fn dos_epoch(d: DosDateTime) -> u64 {
     y -= i64::from(m <= 2);
     let era = if y >= 0 { y } else { y - 399 } / 400;
     let yoe = y - era * 400;
-    let doy = 153 * (i64::from(m) + if m > 2 { -3 } else { 9 }) + 2;
-    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy / 5 + i64::from(dd) - 1;
+    let doy = 153 * (m + if m > 2 { -3 } else { 9 }) + 2;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy / 5 + dd - 1;
     let days = era * 146097 + doe - 719468;
     (days as u64) * 86400 + u64::from(d.hour()) * 3600 + u64::from(d.minute()) * 60 + u64::from(d.second())
 }
@@ -182,29 +182,26 @@ pub fn open(path: &Path, det: &Detected, opts: &OpenOptions) -> anyhow::Result<B
     };
 
     // 分卷:7z .001/.002… 与 zip .zip/.z01…
-    if kind == ArchiveFormat::SevenZ {
-        if let Some(vols) = collect_7z_volumes(path) {
+    if kind == ArchiveFormat::SevenZ
+        && let Some(vols) = collect_7z_volumes(path) {
             let a = ArchiveFormat::open_multi_volume_7z(&vols, to_opts(opts))
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
             return Ok(Box::new(UnarcBackend { inner: boxed(a), current: None }));
         }
-    }
-    if kind == ArchiveFormat::Zip {
-        if let Some(vols) = collect_zip_volumes(path) {
+    if kind == ArchiveFormat::Zip
+        && let Some(vols) = collect_zip_volumes(path) {
             let a = ArchiveFormat::open_multi_volume_zip(&vols, to_opts(opts))
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
             return Ok(Box::new(UnarcBackend { inner: boxed(a), current: None }));
         }
-    }
 
     let file = BufReader::new(File::open(path)?);
     let mut o = to_opts(opts);
     // RAR/ARJ:挂命名模式 provider(单卷不受影响,找不到后继即正常结束)
-    if matches!(kind, ArchiveFormat::Rar | ArchiveFormat::Arj) {
-        if let Some((dir, stem)) = split_dir_stem(path) {
+    if matches!(kind, ArchiveFormat::Rar | ArchiveFormat::Arj)
+        && let Some((dir, stem)) = split_dir_stem(path) {
             o = o.with_volume_provider(PatternVolumes { dir, stem, kind });
         }
-    }
     let mut a = UnifiedArchive::open_with_format_and_options(file, kind, o)
         .map_err(|e| anyhow::anyhow!("{e}"))?;
     if let Some(n) = &opts.single_file_name {

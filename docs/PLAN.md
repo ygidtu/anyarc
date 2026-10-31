@@ -103,10 +103,16 @@ pub struct Capabilities { read: bool, write: bool, password: bool, multi_volume:
 > CLI e2e 133 文件:OK=90、拒绝=41、BAD 仅 `p.arc(.foo)`(unarc-rs 上游 ARC 密码 CRC 已知限制);
 > 容器 10 fixture(含 .foo 孪生)全部 MATCH;`t.udf` 经 UDF 锚点探测路由 Backlog。
 
-| L3 接 crate | lzma 单流(.lzma)、lzip(.lz)、lz4、bzip3 | `lzma-rust2`/`lz4`/`bzip3` crate(iso9660 已改手写,M2-a 完成) | M2-b |
+> **M2-b1 验收(2026-10-31)**:单流 lzma(.lzma/.tar.lzma)/lzip(.lz)/lz4 frame(.lz4)接入;
+> 复合(tar 在内)按 `looks_tar` 自动展开为目录树,单文件按 `single_stem` 命名(支持 .foo 伪装剥离);
+> 矩阵 MATCH=81(+4)、NOREF-OK=19(+6)、MISMATCH=0、FAIL=30;lz fixture 与 7z/patool 内容对拍一致
+> (t.txt.lz→t.txt sha 73475cb4…;t.tar.lz→tar 树)。手写 lzip varint 解析曾把 payload props 字节
+> 误并入 bds(LEB 无 continuation 位歧义)→ 改用 lzma-rust2 标准 LzipReader。
+
+| L3 接 crate | lzma 单流(.lzma)、lzip(.lz)、lz4(.lz4) | lzma-rs(raw,MIT)+ lzma-rust2(LzipReader,Apache-2.0)+ lz4_flex(MIT);**bzip3 排除**(绑定 LGPL-3 C 库,转 Backlog) | **M2-b1 完成**(2026-10-31) |
 | L4 spec 重写 | udf、chm | 按公开规范纯 Rust 实现 | **Backlog 再议**(2026-10-30:需求弱,不排期)。2026-10-31:混合介质(ISO9660+UDF)已可按标准 AVDP(`BEA01VRS`@LBA256/512)与 genisoimage 内嵌指针(LBA18/19)识别,路由 Backlog 报错而非误走 ISO 解析) |
 | L5 音频容器 | flac(`claxon`)、ape(`mac`)、shn(`shorten`) | crate 接入,只读 | M3 |
-| L6 Backlog | alz(ARK,GPL 冲突)、freearc(codec 许可证差)、zpaq/shar/wav(本就外部工具语义)、vhd/wim(磁盘镜像) | **Backlog 再议**;过渡行为 = 识别格式 + 报错指引 | 不排期 |
+| L6 Backlog | alz(ARK,GPL 冲突)、freearc(codec 许可证差)、**bzip3(官方实现为 LGPL-3 C 绑定,2026-10-31 排除)**、zpaq/shar/wav(本就外部工具语义)、vhd/wim(磁盘镜像) | **Backlog 再议**;过渡行为 = 识别格式 + 报错指引 | 不排期 |
 | 永久禁区 | **RAR create** | 无算法/许可证 | 文档明示 |
 
 ## 6. 命令与能力(与 patool 对齐)

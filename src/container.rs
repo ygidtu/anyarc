@@ -33,6 +33,9 @@ pub enum Comp {
     Bzip2,
     Xz,
     Zstd,
+    LzmaAlone,
+    Lzip,
+    Lz4,
 }
 
 pub struct ContainerBackend {
@@ -130,6 +133,27 @@ pub(crate) fn decompress(comp: Comp, raw: &[u8], cap: u64) -> anyhow::Result<Vec
             let mut a = unarc_rs::xz::XzArchive::new(cur).map_err(|e| anyhow::anyhow!("{e}"))?;
             out = a.read_with_limit(Some(cap)).map_err(|e| anyhow::anyhow!("{e}"))?;
         }
+        Comp::LzmaAlone => {
+            let mut r = std::io::BufReader::new(std::io::Cursor::new(raw));
+            let mut cw = Capped { out: &mut out, cap, overflow: false };
+            if let Err(e) = lzma_rs::lzma_decompress(&mut r, &mut cw) {
+                if cw.overflow {
+                    anyhow::bail!("解压尺寸超过上限 {cap}(--max-entry-size)");
+                }
+                anyhow::bail!("lzma: {e}");
+            }
+        }
+        Comp::Lz4 => {
+            let mut d = lz4_flex::frame::FrameDecoder::new(std::io::Cursor::new(raw)).take(cap.saturating_add(1));
+            d.read_to_end(&mut out)?;
+        }
+        Comp::Lzip => {
+            // 标准 lzip 容器解析走 lzma-rust2(tukaani xz-java 移植,Apache-2.0;
+            // 与 sevenz-rust2 同源)。手写 LEB varint 会把 payload props 字节并入
+            // bds 读数(实测 fixture 失败),故弃用。
+            let mut d = lzma_rust2::LzipReader::new(std::io::Cursor::new(raw)).take(cap + 1);
+            d.read_to_end(&mut out)?;
+        }
     }
     if out.len() as u64 > cap {
         anyhow::bail!("解压尺寸超过上限 {cap}(--max-entry-size)");
@@ -152,6 +176,38 @@ pub fn open(path: &Path, det: &Detected, opts: &OpenOptions) -> anyhow::Result<B
         Container::Rpm => parse_rpm(&data)?,
         Container::Cpio => parse_cpio(&data)?,
         Container::Iso => parse_iso(&data)?,
+        // 单流压缩:先整体解压(限额),再判定是 tar 复合还是单条目
+        Container::LzmaAlone | Container::Lzip | Container::Lz4 => {
+            let comp = match container {
+                Container::LzmaAlone => Comp::LzmaAlone,
+                Container::Lzip => Comp::Lzip,
+                _ => Comp::Lz4,
+            };
+            let cap = opts.max_entry_size.unwrap_or(u64::MAX);
+            let bytes = decompress(comp, &data, cap)?;
+            if looks_tar(&bytes) {
+                plan_tar(&bytes)?
+            } else {
+                let name = opts
+                    .single_file_name
+                    .clone()
+                    .or_else(|| single_stem(path))
+                    .unwrap_or_else(|| "output".into());
+                vec![(
+                    Entry {
+                        name,
+                        kind: EntryKind::File,
+                        size: bytes.len() as u64,
+                        compressed_size: data.len() as u64,
+                        method: comp_label(comp).into(),
+                        mtime_epoch: None,
+                        encrypted: false,
+                        link_target: None,
+                    },
+                    Fetch::Inline(bytes),
+                )]
+            }
+        }
     };
     let fmt = match container {
         Container::Ar => Format::Ar,
@@ -159,6 +215,9 @@ pub fn open(path: &Path, det: &Detected, opts: &OpenOptions) -> anyhow::Result<B
         Container::Rpm => Format::Rpm,
         Container::Cpio => Format::Cpio,
         Container::Iso => Format::Iso,
+        Container::LzmaAlone => Format::LzmaAlone,
+        Container::Lzip => Format::Lzip,
+        Container::Lz4 => Format::Lz4,
     };
     Ok(Box::new(ContainerBackend::new(fmt, path, plan, opts.max_entry_size)))
 }
@@ -248,7 +307,7 @@ fn parse_ar(data: &[u8]) -> anyhow::Result<Vec<(Entry, u64, u64)>> {
                     size: (size - name_extra) as u64,
                     compressed_size: (size - name_extra) as u64,
                     method: "Stored".into(),
-                    mtime_epoch: (mtime > 0).then_some(mtime as u64),
+                    mtime_epoch: (mtime > 0).then_some(mtime),
                     encrypted: false,
                     link_target: None,
                 },
@@ -271,12 +330,7 @@ fn parse_deb(data: &[u8]) -> anyhow::Result<Vec<(Entry, Fetch)>> {
             Some(fetch) => {
                 let method = match fetch {
                     None => "Stored",
-                    Some(comp) => match comp {
-                        Comp::Gzip => "GZip",
-                        Comp::Bzip2 => "BZip2",
-                        Comp::Xz => "Xz",
-                        Comp::Zstd => "Zstd",
-                    },
+                    Some(comp) => comp_label(comp),
                 };
                 let entry = Entry {
                     name: "data.tar".into(),
@@ -324,7 +378,7 @@ fn parse_ar_with_offsets(data: &[u8]) -> anyhow::Result<Vec<(String, u64, u64)>>
             break;
         }
         let name = String::from_utf8_lossy(&hdr[0..16]).trim_end().to_string();
-        let size = ascii_num(&hdr[48..58]).unwrap_or(0) as u64;
+        let size = ascii_num(&hdr[48..58]).unwrap_or(0);
         out.push((name, (pos + 60) as u64, size));
         pos = pos + 60 + size as usize + (size as usize % 2);
     }
@@ -340,7 +394,7 @@ fn parse_rpm(data: &[u8]) -> anyhow::Result<Vec<(Entry, Fetch)>> {
     let mut pos = 96usize;
     // 可选 signature header:同 magic,若其后(8 对齐处)还有第二个 header 区,则本区为 signature
     if data.len() >= pos + 20 && &data[pos..pos + 3] == b"\x8e\xad\xe8" {
-        let (n1, h1) = read_region(&data, pos)?;
+        let (n1, h1) = read_region(data, pos)?;
         let next = (pos + 16 + 16 * n1 + h1 + 7) & !7;
         if data.len() >= next + 3 && &data[next..next + 3] == b"\x8e\xad\xe8" {
             pos = next;
@@ -524,7 +578,7 @@ fn parse_cpio_bin(data: &[u8], be: bool, hp: bool) -> anyhow::Result<Vec<(Entry,
         let mut name = String::from_utf8_lossy(&data[pos + 26..pos + 26 + namesize - 1])
             .trim_end_matches('\0')
             .to_string();
-        let doff = pos + 26 + (namesize + 1) & !1;
+        let doff = (pos + 26 + (namesize + 1)) & !1;
         if doff + filesize as usize > data.len() {
             anyhow::bail!("cpio(bin): 数据越界");
         }
@@ -581,7 +635,7 @@ fn parse_iso(data: &[u8]) -> anyhow::Result<Vec<(Entry, Fetch)>> {
     for p in [126usize, 128] {
         let le = u16::from_le_bytes([data[32768 + p], data[32768 + p + 1]]) as usize;
         let be = u16::from_be_bytes([data[32768 + p + 2], data[32768 + p + 3]]) as usize;
-        if le == be && le >= 2048 && le % 2048 == 0 {
+        if le == be && le >= 2048 && le.is_multiple_of(2048) {
             sector = le;
             break;
         }
@@ -682,7 +736,7 @@ fn parse_iso(data: &[u8]) -> anyhow::Result<Vec<(Entry, Fetch)>> {
 
 fn decode_iso_name(raw: &[u8], joliet: bool) -> String {
     let mut s = if joliet {
-        let units: Vec<u16> = raw.chunks_exact(2).map(|c| u16::from_be_bytes([c[0], c[1]])).collect();
+        let units: Vec<u16> = raw.as_chunks::<2>().0.iter().map(|c| u16::from_be_bytes([c[0], c[1]])).collect();
         String::from_utf16_lossy(&units)
     } else {
         String::from_utf8_lossy(raw).into_owned()
@@ -709,4 +763,161 @@ fn ascii_num_oct(s: &[u8]) -> Option<u32> {
         return Some(0);
     }
     u32::from_str_radix(t, 8).ok()
+}
+
+// ------------------------------------------------------------------ 单流压缩(lzma-alone / lzip / lz4)
+
+/// 写入侧限额器(Write 无标准 take 适配器):超限置 overflow 并中断解码。
+struct Capped<'a> {
+    out: &'a mut Vec<u8>,
+    cap: u64,
+    overflow: bool,
+}
+impl std::io::Write for Capped<'_> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if self.out.len() as u64 + buf.len() as u64 > self.cap {
+            self.overflow = true;
+            return Err(std::io::Error::new(std::io::ErrorKind::WriteZero, "size limit"));
+        }
+        self.out.extend_from_slice(buf);
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+fn comp_label(c: Comp) -> &'static str {
+    match c {
+        Comp::Gzip => "GZip",
+        Comp::Bzip2 => "BZip2",
+        Comp::Xz => "Xz",
+        Comp::Zstd => "Zstd",
+        Comp::LzmaAlone => "LzmaAlone",
+        Comp::Lzip => "Lzip",
+        Comp::Lz4 => "Lz4",
+    }
+}
+
+/// 字节流是否以合法 tar 头开始(ustar 魔数 + 头和校验)。
+/// 字节流是否以合法 tar 头开始(ustar 魔数 + 头和校验)。
+fn looks_tar(b: &[u8]) -> bool {
+    if b.len() < 512 || &b[257..262] != b"ustar" {
+        return false;
+    }
+    let given = tar_octal(&b[148..156]);
+    let sum: u32 = b[..512]
+        .iter()
+        .enumerate()
+        .map(|(i, &c)| if (148..156).contains(&i) { 32 } else { c as u32 })
+        .sum();
+    given == Some(sum)
+}
+
+fn tar_octal(f: &[u8]) -> Option<u32> {
+    let s: String = f
+        .iter()
+        .map(|&b| b as char)
+        .take_while(|c| *c != '\0' && *c != ' ')
+        .collect();
+    u32::from_str_radix(s.trim(), 8).ok()
+}
+
+/// 把 tar 字节流经 `tar` crate(unarc 同款)展开为条目计划。
+fn plan_tar(bytes: &[u8]) -> anyhow::Result<Vec<(Entry, Fetch)>> {
+    let mut ar = tar::Archive::new(std::io::Cursor::new(bytes));
+    let mut out = Vec::new();
+    for e in ar.entries()? {
+        let mut e = e?;
+        if out.len() >= MAX_ENTRIES {
+            break;
+        }
+        let (et, size, mtime) = {
+            let h = e.header();
+            (h.entry_type(), h.size().unwrap_or(0), h.mtime().ok())
+        };
+        let name = e.path()?.to_string_lossy().into_owned();
+        if name.is_empty() {
+            continue;
+        }
+        let kind = if et == tar::EntryType::Directory {
+            EntryKind::Directory
+        } else if et == tar::EntryType::Symlink {
+            EntryKind::Symlink
+        } else if et == tar::EntryType::Link {
+            EntryKind::HardLink
+        } else if et == tar::EntryType::Char || et == tar::EntryType::Block || et == tar::EntryType::Fifo {
+            EntryKind::Special
+        } else {
+            EntryKind::File
+        };
+        let link_target = if et == tar::EntryType::Symlink || et == tar::EntryType::Link {
+            e.link_name().ok().flatten().map(|p| p.to_string_lossy().into_owned())
+        } else {
+            None
+        };
+        let data = if kind == EntryKind::File {
+            let mut v = Vec::new();
+            e.read_to_end(&mut v)?;
+            v
+        } else {
+            Vec::new()
+        };
+        out.push((
+            Entry {
+                name,
+                kind,
+                size: if kind == EntryKind::File { size } else { 0 },
+                compressed_size: size,
+                method: "Tar".into(),
+                mtime_epoch: mtime,
+                encrypted: false,
+                link_target,
+            },
+            Fetch::Inline(data),
+        ));
+    }
+    Ok(out)
+}
+
+/// 从路径推单流解压目标名(去 .foo 伪装,再去压缩扩展)。
+fn single_stem(path: &Path) -> Option<String> {
+    let name = path.file_name()?.to_str()?;
+    let lower = name.to_lowercase();
+    let has_foo = lower.ends_with(".foo");
+    // 压缩后缀是 ASCII:按字节长切原始名安全(伪装的 .foo 同为 ASCII 尾)
+    let core = if has_foo { &lower[..lower.len() - 4] } else { &lower };
+    for suf in [".lzma", ".lz4", ".lz"] {
+        if core.ends_with(suf) {
+            let cut = name.len() - suf.len() - if has_foo { 4 } else { 0 };
+            return Some(name[..cut].to_string());
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn single_stem_strips_foo_and_comp_ext() {
+        let p = |s: &str| single_stem(Path::new(s));
+        assert_eq!(p("t.txt.lzma").as_deref(), Some("t.txt"));
+        assert_eq!(p("t.txt.lzma.foo").as_deref(), Some("t.txt"));
+        assert_eq!(p("T.TAR.LZMA").as_deref(), Some("T.TAR"));
+        assert_eq!(p("x.lz").as_deref(), Some("x"));
+        assert_eq!(p("x.LZ4.foo").as_deref(), Some("x"));
+        assert_eq!(p("noext").as_deref(), None);
+        assert_eq!(p("t.txt.gz").as_deref(), None); // gz 走 unarc 路径,不经此函数
+    }
+
+    #[test]
+    fn looks_tar_rejects_garbage() {
+        assert!(!looks_tar(&[0u8; 512]));
+        let mut h = vec![0u8; 512];
+        h[257..262].copy_from_slice(b"ustar");
+        // 头和字段清零 → 校验和必然不符
+        assert!(!looks_tar(&h));
+    }
 }

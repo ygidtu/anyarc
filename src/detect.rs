@@ -48,6 +48,12 @@ pub enum Container {
     Rpm,
     Cpio,
     Iso,
+    /// LZMA-alone 单流(.lzma,13 字节头)
+    LzmaAlone,
+    /// lzip 容器(.lz,"LZIP" 成员流)
+    Lzip,
+    /// LZ4 frame(.lz4)
+    Lz4,
 }
 
 /// 探测结果。`prefix_bytes` 仅对 Zip 有意义:zip 体前的junk 数据长度
@@ -95,6 +101,19 @@ pub fn detect(path: &Path) -> std::io::Result<Option<Detected>> {
     if matches!(head, [0xC7, 0x01, ..] | [0x01, 0xC7, ..] | [0xC7, 0x71, ..] | [0x71, 0xC7, ..]) {
         return Ok(Some(Detected { kind: Known::Container(Container::Cpio), prefix_bytes: 0 }));
     }
+    // LZMA-alone:props 字节(<225)+ 字典大小须为 2 的幂(排除文本误报)
+    if head.len() >= 13 && head[0] < 225 {
+        let dict = u32::from_le_bytes([head[1], head[2], head[3], head[4]]);
+        if dict >= 4096 && dict.is_power_of_two() {
+            return Ok(Some(Detected { kind: Known::Container(Container::LzmaAlone), prefix_bytes: 0 }));
+        }
+    }
+    if head.starts_with(b"LZIP") && matches!(head.get(4), Some(1)) {
+        return Ok(Some(Detected { kind: Known::Container(Container::Lzip), prefix_bytes: 0 }));
+    }
+    if head.starts_with(&[0x04, 0x22, 0x4D, 0x18]) {
+        return Ok(Some(Detected { kind: Known::Container(Container::Lz4), prefix_bytes: 0 }));
+    }
     let len = file.seek(SeekFrom::End(0))?;
     if len >= 32774 {
         file.seek(SeekFrom::Start(32769))?;
@@ -131,18 +150,16 @@ pub fn detect(path: &Path) -> std::io::Result<Option<Detected>> {
     };
 
     // 3) 复合流二跳:单流压缩头 → 解压 peek tar header
-    if let Some(Known::Unarc(f)) = base {
-        if let Some(compound) = compound_stream_fix(&mut file, f)? {
+    if let Some(Known::Unarc(f)) = base
+        && let Some(compound) = compound_stream_fix(&mut file, f)? {
             return Ok(Some(Detected { kind: Known::Unarc(compound), prefix_bytes: 0 }));
         }
-    }
 
     // 4) 仍未识别 → EOCD 反向扫描(前置数据 zip / polyglot)
-    if base.is_none() || matches!(base, Some(Known::Unarc(_))) {
-        if let Some(prefix) = eocd_scan(&mut file)? {
+    if (base.is_none() || matches!(base, Some(Known::Unarc(_))))
+        && let Some(prefix) = eocd_scan(&mut file)? {
             return Ok(Some(Detected { kind: Known::Unarc(ArchiveFormat::Zip), prefix_bytes: prefix }));
         }
-    }
 
     Ok(base.map(|kind| Detected { kind, prefix_bytes: 0 }))
 }
@@ -158,7 +175,7 @@ fn ext_hint(path: &Path) -> Option<Known> {
         ("tar.xz", Known::Unarc(ArchiveFormat::Txz)),
         ("tar.zst", Known::Unarc(ArchiveFormat::Tzst)),
         // unarc 0.8.1 无 LZMA-alone 解码路径,Txz 会报 "invalid XZ magic" → 明确 Backlog
-        ("tar.lzma", Known::Backlog(Backlog::LzmaAlone)),
+        ("tar.lzma", Known::Container(Container::LzmaAlone)),
     ];
     for (e, k) in long_exts {
         if name.ends_with(e) {
@@ -185,7 +202,9 @@ fn ext_hint(path: &Path) -> Option<Known> {
         "wim" => Known::Backlog(Backlog::Wim),
         "udf" => Known::Backlog(Backlog::Udf),
         "chm" => Known::Backlog(Backlog::Chm),
-        "lzma" => Known::Backlog(Backlog::LzmaAlone),
+        "lzma" => Known::Container(Container::LzmaAlone),
+        "lz" => Known::Container(Container::Lzip),
+        "lz4" => Known::Container(Container::Lz4),
         // 自写容器(M2)
         "cpio" => Known::Container(Container::Cpio),
         "iso" => Known::Container(Container::Iso),
@@ -364,11 +383,11 @@ pub fn eocd_scan(file: &mut File) -> std::io::Result<Option<u64>> {
                 let cd_off = u32::from_le_bytes([eocd[16], eocd[17], eocd[18], eocd[19]]) as u64;
 
                 // ZIP64 哨兵 → 前 20B 找 Locator,再读 ZIP64 EOCD record
-                if (cd_off == 0xFFFFFFFF || entries == 0xFFFF) && j >= 20 {
-                    if &tail[j - 20..j - 16] == ZIP64_EOCD_LOCATOR_MAGIC {
+                if (cd_off == 0xFFFFFFFF || entries == 0xFFFF) && j >= 20
+                    && &tail[j - 20..j - 16] == ZIP64_EOCD_LOCATOR_MAGIC {
                         let z64_off = u64::from_le_bytes(tail[j - 16..j - 8].try_into().unwrap());
-                        if z64_off < len {
-                            if let Some((e64, c64, s64)) = read_zip64_eocd(file, z64_off) {
+                        if z64_off < len
+                            && let Some((e64, c64, s64)) = read_zip64_eocd(file, z64_off) {
                                 let eocd_abs = len - win + j as u64;
                                 if let Some(prefix) = eocd_abs.checked_sub(c64 + s64) {
                                     if check_cd_at(file, c64, e64, s64) {
@@ -379,9 +398,7 @@ pub fn eocd_scan(file: &mut File) -> std::io::Result<Option<u64>> {
                                     }
                                 }
                             }
-                        }
                     }
-                }
 
                 // 关键:EOCD_abs = prefix + cd_off + cd_size(EOCD 记录紧接 CD 之后)
                 // → prefix = EOCD_abs − cd_off − cd_size;实际语义由 CD 签名校验裁决

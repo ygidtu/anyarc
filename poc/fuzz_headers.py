@@ -5,7 +5,7 @@ import os, random, shutil, subprocess, sys, tempfile
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 BIN_SRC = os.path.join(ROOT, "target/release/anyarc")
-BIN = os.path.join("/tmp/opencode", "anyarc_fuzz_bin")
+BIN = os.path.join("/tmp/opencode", "anyarc_fuzz_hdr_bin")
 shutil.copyfile(BIN_SRC, BIN)
 os.chmod(BIN, 0o755)
 DATA = os.environ.get("ANYARC_FIXTURES", "/home/zym/code/patool/tests/data")
@@ -17,6 +17,10 @@ TARGETS = {
     "t.rpm":   [(0, 120), (1384, 1500), (8320, 8400)],  # lead / 主头 / payload magic
     "t.cpio":  [(0, 200)],                       # hpbin 头 + 名字
     "t.iso":   [(32768, 33024), (34816, 35072), (0xf000, 0xf044 + 72)],  # PVD/SVD/根目录记录
+    # 单流压缩头:lzma props+dict(13B)/lzip 成员头+trailer/lz4 frame 头+block 头
+    "t.txt.lzma": [(0, 13)],
+    "t.txt.lz":   [(0, 16), (30, 38)],
+    "t.txt.lz4":  [(0, 7), (7, 15)],
 }
 VALUES = [0x00, 0x01, 0x02, 0x34, 0x41, 0x7F, 0x80, 0xC7, 0xFF]
 TIMEOUT = 10
