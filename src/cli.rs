@@ -120,6 +120,9 @@ pub struct DiffArgs {
     /// 条目名编码修复
     #[arg(short = 'e', long)]
     pub encoding: Option<String>,
+    /// JSON 输出(only_a/only_b/differ 数组)
+    #[arg(long)]
+    pub json: bool,
     #[arg(short = 'q', long)]
     pub quiet: bool,
 }
@@ -136,6 +139,9 @@ pub struct SearchArgs {
     /// 忽略大小写
     #[arg(short = 'i', long)]
     pub ignore_case: bool,
+    /// JSON 输出(每条命中一行对象)
+    #[arg(long)]
+    pub json: bool,
     #[arg(short = 'q', long)]
     pub quiet: bool,
 }
@@ -342,6 +348,8 @@ fn extract_one(
     let mut n_overwrite_skip = 0usize;
     let show_progress = crate::extract::is_tty() && !args.common.quiet;
     let mut seq = 0usize;
+    // 捐赠者尚未出现的硬链接(pass 2 处理;cpio 允许 dup 排在数据条目之前)
+    let mut deferred_links: Vec<(std::path::PathBuf, String)> = Vec::new();
 
     while let Some(entry) = ar.next_entry()? {
         seq += 1;
@@ -412,7 +420,8 @@ fn extract_one(
                 ar.skip_current()?;
             }
             EntryKind::HardLink => {
-                // M1:硬链接条目按"读内容写文件"降级(保持可读性),后续换真硬链接
+                // 真实硬链接:link_target 是归档内另一条目路径,解到 dest 下同一位置
+                // 即得磁盘硬链接(共享 inode);目标不存在/平台不支持时降级为写内容。
                 let Some(p) = safe_join(dest, &name) else {
                     n_skipped += 1;
                     ar.skip_current()?;
@@ -423,18 +432,65 @@ fn extract_one(
                     ar.skip_current()?;
                     continue;
                 }
-                let data = ar.read_current()?;
-                if let Some(parent) = p.parent() {
-                    std::fs::create_dir_all(parent)?;
+                let mut linked = false;
+                if let Some(tgt) = entry.link_target.as_deref() {
+                    if let Some(tp) = safe_join(dest, tgt) {
+                        if tp.is_file() {
+                            if let Some(parent) = p.parent() {
+                                std::fs::create_dir_all(parent)?;
+                            }
+                            let _ = std::fs::remove_file(&p);
+                            if std::fs::hard_link(&tp, &p).is_ok() {
+                                linked = true;
+                                n_file += 1;
+                            }
+                        }
+                    }
                 }
-                std::fs::write(&p, &data)?;
-                n_file += 1;
+                if linked {
+                    ar.skip_current()?;
+                } else if entry.link_target.is_some() && !std::fs::File::open(&p).is_ok_and(|f| f.metadata().is_ok_and(|m| m.len() > 0)) {
+                    // 捐赠者还没被解出(或本就 0 字节):记下,主循环后 pass 2 再链接
+                    deferred_links.push((p, entry.link_target.clone().unwrap()));
+                    ar.skip_current()?;
+                } else {
+                    // 降级路径:读内容写普通文件(保持可读性优先)
+                    let data = ar.read_current()?;
+                    if let Some(parent) = p.parent() {
+                        std::fs::create_dir_all(parent)?;
+                    }
+                    std::fs::write(&p, &data)?;
+                    n_file += 1;
+                }
             }
             EntryKind::Special => {
                 n_skipped += 1;
                 ar.skip_current()?;
             }
         }
+    }
+    // pass 2:早于捐赠者出现的硬链接,此时按磁盘路径再试一次
+    for (p, tgt) in deferred_links {
+        let tp = match safe_join(dest, &tgt) {
+            Some(t) => t,
+            None => {
+                n_skipped += 1;
+                continue;
+            }
+        };
+        if tp.is_file() {
+            let _ = std::fs::remove_file(&p);
+            if std::fs::hard_link(&tp, &p).is_ok() {
+                n_file += 1;
+                continue;
+            }
+        }
+        // 捐赠者最终仍不存在:按 cpio 语义写空文件(不阻塞后续)
+        if let Some(parent) = p.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(&p, b"")?;
+        n_file += 1;
     }
     if show_progress {
         eprintln!("\r解压完成: {} 个文件, {} 个目录({})", n_file, n_dir, path.display());
@@ -645,28 +701,40 @@ pub fn cmd_diff(args: &DiffArgs) -> anyhow::Result<u8> {
     let enc = args.encoding.as_deref().map(lookup_encoding).transpose()?;
     let a = archive_digest(&args.archives[0], args.password.clone(), enc, args.quiet)?;
     let b = archive_digest(&args.archives[1], args.password.clone(), enc, args.quiet)?;
-    let mut diffs = 0usize;
-    for (k, v) in a.iter().filter(|(k, _)| !b.contains_key(*k)) {
-        println!("只在 A: {k}");
-        let _ = v;
-        diffs += 1;
-    }
-    for (k, v) in b.iter().filter(|(k, _)| !a.contains_key(*k)) {
-        println!("只在 B: {k}");
-        let _ = v;
-        diffs += 1;
-    }
-    for (k, va) in &a {
-        if let Some(vb) = b.get(k)
-            && va != vb {
-                println!("内容不同: {k}");
-                diffs += 1;
-            }
-    }
-    if diffs == 0 {
-        if !args.quiet {
+    let only_a: Vec<&String> = a.iter().filter(|(k, _)| !b.contains_key(*k)).map(|(k, _)| k).collect();
+    let only_b: Vec<&String> = b.iter().filter(|(k, _)| !a.contains_key(*k)).map(|(k, _)| k).collect();
+    let differ: Vec<&String> = a
+        .iter()
+        .filter(|(k, va)| b.get(*k).is_some_and(|vb| vb.as_str() != va.as_str()))
+        .map(|(k, _)| k)
+        .collect();
+    let diffs = only_a.len() + only_b.len() + differ.len();
+    if args.json {
+        let arr = |v: &[&String]| -> String {
+            v.iter().map(|k| format!("\"{}\"", json_escape(k))).collect::<Vec<_>>().join(",")
+        };
+        println!(
+            "{{\"same\":{},\"only_a\":[{}],\"only_b\":[{}],\"differ\":[{}]}}",
+            diffs == 0,
+            arr(&only_a),
+            arr(&only_b),
+            arr(&differ)
+        );
+    } else {
+        for k in only_a {
+            println!("只在 A: {k}");
+        }
+        for k in only_b {
+            println!("只在 B: {k}");
+        }
+        for k in differ {
+            println!("内容不同: {k}");
+        }
+        if diffs == 0 && !args.quiet {
             eprintln!("两个归档内容一致({} 个条目)", a.len());
         }
+    }
+    if diffs == 0 {
         Ok(0)
     } else {
         Ok(1) // 有差异(与 diff 命令语义一致)
@@ -728,7 +796,17 @@ pub fn cmd_search(args: &SearchArgs) -> anyhow::Result<u8> {
         while let Some(e) = ar.next_entry()? {
             let name = fixed_name(&e.name, enc);
             if name_match(&args.pattern, &name, args.ignore_case) {
-                println!("{}: {}", path.display(), name);
+                if args.json {
+                    println!(
+                        "{{\"archive\":\"{}\",\"entry\":\"{}\",\"size\":{},\"kind\":\"{}\"}}",
+                        json_escape(&path.display().to_string()),
+                        json_escape(&name),
+                        e.size,
+                        kind_str(e.kind)
+                    );
+                } else {
+                    println!("{}: {}", path.display(), name);
+                }
                 hits += 1;
             }
             ar.skip_current()?;

@@ -129,6 +129,16 @@ pub struct Capabilities { read: bool, write: bool, password: bool, multi_volume:
 > tar→zip(含 symlink)全部 diff 一致;diff 语义=条目名+sha256(0/1/2 退出),search=glob/子串(grep 退出)。
 > 修 diff/repack 循环 Dir/Symlink 未 skip 死循环(trait 契约:读或 skip 后才前进)。
 
+> **M3-c/M3-d 验收(2026-10-31)**:extract 的 HardLink 条目改真实硬链接(`fs::hard_link` 到
+> 捐赠者解出路径,失败降级写内容;hl.tar/hl.tar.gz inode 一致✓);`diff`/`search` 增 `--json`。
+> cpio newc 两处存量 bug 修复:①while 条件 `&data[pos..pos+6] == b"0707"`(6 字节切片 vs 4 字节
+> 数组恒不等)→ newc 条目流从未被解析过(list 空);②namesize/chksum 字段偏移(标准 namesize@94
+> chksum@102,误写 @86/@94)。并给 newc/bin/hpbin 全部接入 (dev,ino) 硬链接二段归并(GNU cpio
+> 把数据挂在后出现的 dup 名下,dup 排前;按"带数据的捐赠者"选主而非出现顺序),extract 加 pass 2
+> 延后硬链接(目标未出现时先记,主循环后补链)。回归:单测 14(新增 newc hardlink 合成用例);
+> 矩阵 81/19/0/30 不变;e2e OK=100 BAD=2(仅 p.arc 上游);fuzz_mutate 3060 + newc 定向 fuzz
+> 2400 CRASH=0;hpbin fixture t.cpio 行为不变。
+
 | L3 接 crate | lzma 单流(.lzma)、lzip(.lz)、lz4(.lz4) | lzma-rs(raw,MIT)+ lzma-rust2(LzipReader,Apache-2.0)+ lz4_flex(MIT);**bzip3 排除**(绑定 LGPL-3 C 库,转 Backlog) | **M2-b1 完成**(2026-10-31) |
 | L4 spec 重写 | udf、chm | 按公开规范纯 Rust 实现 | **Backlog 再议**(2026-10-30:需求弱,不排期)。2026-10-31:混合介质(ISO9660+UDF)已可按标准 AVDP(`BEA01VRS`@LBA256/512)与 genisoimage 内嵌指针(LBA18/19)识别,路由 Backlog 报错而非误走 ISO 解析) |
 | L5 音频容器 | flac(`claxon`)、ape(`mac`)、shn(`shorten`) | crate 接入,只读 | M3 |

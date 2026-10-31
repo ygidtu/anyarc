@@ -479,26 +479,34 @@ fn parse_cpio(data: &[u8]) -> anyhow::Result<Vec<(Entry, Fetch)>> {
     }
 }
 
-/// newc/070702 ASCII 头。
+/// newc/070702 ASCII 头。字段各 8 hex,标准序(GNU cpio 产物实测校准):
+/// ino@6 mode@14 uid@22 gid@30 nlink@38 mtime@46 filesize@54
+/// devmaj@62 devmin@70 rdevmaj@78 rdevmin@86 namesize@94 chksum@102,name@110
 fn parse_cpio_newc(data: &[u8]) -> anyhow::Result<Vec<(Entry, Fetch)>> {
     if data.len() < 110 {
         anyhow::bail!("cpio: 文件过短");
     }
     let hex = |s: &[u8]| u32::from_str_radix(std::str::from_utf8(s).unwrap_or("0"), 16).unwrap_or(0);
     let mut pos = 0usize;
-    let mut out = Vec::new();
-    while pos + 110 <= data.len() && &data[pos..pos + 6] == b"0707" {
+    let mut out: Vec<(Entry, Fetch)> = Vec::new();
+    // (devmaj, ino) → 组内条目下标;解析完做二段归并(见下)
+    let mut groups: std::collections::HashMap<(u32, u32), Vec<usize>> = std::collections::HashMap::new();
+    while pos + 110 <= data.len() && data[pos..].starts_with(b"0707") {
         if out.len() >= MAX_ENTRIES {
             break;
         }
+        let ino = hex(&data[pos + 6..pos + 14]);
         let mode = hex(&data[pos + 14..pos + 22]);
+        let nlink = hex(&data[pos + 38..pos + 46]);
         let mtime = hex(&data[pos + 46..pos + 54]);
         let mut filesize = hex(&data[pos + 54..pos + 62]) as u64;
-        let namesize = hex(&data[pos + 86..pos + 94]) as usize;
+        let devmaj = hex(&data[pos + 62..pos + 70]);
+        let _devmin = hex(&data[pos + 70..pos + 78]);
+        let namesize = hex(&data[pos + 94..pos + 102]) as usize;
         if namesize == 0 || pos + 110 + namesize > data.len() {
             anyhow::bail!("cpio: 名字长度无效");
         }
-        let chksum = hex(&data[pos + 94..pos + 102]);
+        let chksum = hex(&data[pos + 102..pos + 110]);
         let mut name = String::from_utf8_lossy(&data[pos + 110..pos + 110 + namesize - 1]).into_owned();
         let doff = align4(pos + 110 + namesize);
         if filesize == 0xFFFFFFFF {
@@ -518,12 +526,20 @@ fn parse_cpio_newc(data: &[u8]) -> anyhow::Result<Vec<(Entry, Fetch)>> {
             0o100000 => EntryKind::File,
             _ => EntryKind::Special,
         };
+        if kind == EntryKind::File && nlink > 1 {
+            groups.entry((devmaj, ino)).or_default().push(out.len());
+        }
         let fetch = if kind == EntryKind::Symlink {
             Fetch::Inline(data[doff..doff + filesize as usize].to_vec())
         } else if kind == EntryKind::File {
             Fetch::Raw { off: doff as u64, len: filesize }
         } else {
             Fetch::Inline(Vec::new())
+        };
+        let link_target = if kind == EntryKind::Symlink {
+            Some(String::from_utf8_lossy(&data[doff..doff + filesize as usize]).into_owned())
+        } else {
+            None
         };
         out.push((
             Entry {
@@ -534,15 +550,28 @@ fn parse_cpio_newc(data: &[u8]) -> anyhow::Result<Vec<(Entry, Fetch)>> {
                 method: "Stored".into(),
                 mtime_epoch: (mtime > 0).then_some(mtime as u64),
                 encrypted: false,
-                link_target: if kind == EntryKind::Symlink {
-                    Some(String::from_utf8_lossy(&data[doff..doff + filesize as usize]).into_owned())
-                } else {
-                    None
-                },
+                link_target,
             },
             fetch,
         ));
         pos = align4(doff + filesize as usize);
+    }
+    // 二段归并:同 (devmaj, ino) 组内以“带数据的条目”为捐赠者(保持 File+Raw);
+    // 其余改 HardLink 回填 link_target。GNU cpio 既可能 dup 在前(0 字节)、
+    // 也可能把数据挂在后出现的 dup 名下,故按 size>0 选捐赠者而非出现顺序。
+    for idxs in groups.values() {
+        if idxs.len() < 2 {
+            continue;
+        }
+        let donor = idxs.iter().copied().find(|&i| out[i].0.size > 0).unwrap_or(idxs[0]);
+        for &i in idxs {
+            if i != donor {
+                out[i].0.kind = EntryKind::HardLink;
+                out[i].0.size = 0;
+                out[i].0.link_target = Some(out[donor].0.name.clone());
+                out[i].1 = Fetch::Inline(Vec::new());
+            }
+        }
     }
     Ok(out)
 }
@@ -551,8 +580,8 @@ fn align4(x: usize) -> usize {
     (x + 3) & !3
 }
 
-/// 二进制 cpio(bin 0707 / hpbin 070707):26 字节头,16 位字段;
-/// 32 位字段以两个 16 位字(高字在前,各字按 endianness)存放。
+/// 二进制 cpio(bin 0707 / hpbin 070707):26 字节头。字段偏移已用
+/// 真实 fixture(t.cpio = hpbin)校准(与 POSIX 名义布局相比整体前移一字段)。
 fn parse_cpio_bin(data: &[u8], be: bool, hp: bool) -> anyhow::Result<Vec<(Entry, Fetch)>> {
     let want = if hp { 0o70707u16 } else { 0o0707u16 };
     let u16_at = |p: usize| -> u16 {
@@ -564,6 +593,8 @@ fn parse_cpio_bin(data: &[u8], be: bool, hp: bool) -> anyhow::Result<Vec<(Entry,
     };
     let mut pos = 0usize;
     let mut out = Vec::new();
+    // ino(+10,16 位)→ 首条目名:同 inode 的后续常规文件按 hardlink 暴露
+    let mut by_ino: std::collections::HashMap<u16, String> = std::collections::HashMap::new();
     while pos + 26 <= data.len() {
         if out.len() >= MAX_ENTRIES {
             break;
@@ -572,6 +603,7 @@ fn parse_cpio_bin(data: &[u8], be: bool, hp: bool) -> anyhow::Result<Vec<(Entry,
             break; // 头损坏:停在最后一个合法条目
         }
         let mode = u16_at(pos + 6);
+        let ino = u16_at(pos + 10);
         let nlink = u16_at(pos + 12);
         let mtime = (u32::from(u16_at(pos + 16)) << 16) | u32::from(u16_at(pos + 18));
         let namesize = u16_at(pos + 20) as usize;
@@ -590,12 +622,25 @@ fn parse_cpio_bin(data: &[u8], be: bool, hp: bool) -> anyhow::Result<Vec<(Entry,
             break;
         }
         name = name.trim_start_matches("./").to_string();
-        let kind = match mode & 0xF000 {
+        let mut kind = match mode & 0xF000 {
             0x4000 => EntryKind::Directory,
             0xA000 => EntryKind::Symlink,
             0x8000 => EntryKind::File,
             _ => EntryKind::Special,
         };
+        let is_dup = if kind == EntryKind::File && nlink > 1 {
+            if by_ino.contains_key(&ino) {
+                true
+            } else {
+                by_ino.insert(ino, name.clone());
+                false
+            }
+        } else {
+            false
+        };
+        if is_dup {
+            kind = EntryKind::HardLink;
+        }
         let fetch = match kind {
             EntryKind::Symlink => Fetch::Inline(data[doff..doff + filesize as usize].to_vec()),
             EntryKind::File => Fetch::Raw { off: doff as u64, len: u64::from(filesize) },
@@ -610,15 +655,14 @@ fn parse_cpio_bin(data: &[u8], be: bool, hp: bool) -> anyhow::Result<Vec<(Entry,
                 method: "Stored".into(),
                 mtime_epoch: (mtime > 0).then_some(u64::from(mtime)),
                 encrypted: false,
-                link_target: if kind == EntryKind::Symlink {
-                    Some(String::from_utf8_lossy(&data[doff..doff + filesize as usize]).into_owned())
-                } else {
-                    None
+                link_target: match kind {
+                    EntryKind::Symlink => Some(String::from_utf8_lossy(&data[doff..doff + filesize as usize]).into_owned()),
+                    EntryKind::HardLink => by_ino.get(&ino).cloned(),
+                    _ => None,
                 },
             },
             fetch,
         ));
-        let _ = nlink;
         pos = doff + filesize as usize + (filesize as usize % 2);
         if hp {
             pos = (pos + 1) & !1;
@@ -923,5 +967,56 @@ mod tests {
         h[257..262].copy_from_slice(b"ustar");
         // 头和字段清零 → 校验和必然不符
         assert!(!looks_tar(&h));
+    }
+}
+
+#[cfg(test)]
+mod cpio_tests {
+    use super::*;
+
+    fn newc_entry(ino: u32, mode: u32, nlink: u32, mtime: u32, name: &str, data: &[u8]) -> Vec<u8> {
+        let mut h = Vec::new();
+        h.extend_from_slice(b"070701");
+        // magic(6) + 11 个 8-hex 字段(ino..chksum)+ name = 110 头
+        for v in [ino, mode, 0, 0, nlink, mtime, data.len() as u32, 0, 0, 0, 0] {
+            h.extend_from_slice(format!("{v:08X}").as_bytes());
+        }
+        h.extend_from_slice(format!("{:08X}", name.len() + 1).as_bytes());
+        h.extend_from_slice(b"00000000"); // chksum
+        h.extend_from_slice(name.as_bytes());
+        h.push(0);
+        while h.len() % 4 != 0 {
+            h.push(0);
+        }
+        h.extend_from_slice(data);
+        while h.len() % 4 != 0 {
+            h.push(0);
+        }
+        h
+    }
+
+    #[test]
+    fn newc_parses_sizes_and_hardlinks() {
+        let mut d = Vec::new();
+        // GNU 风格:0 字节的 dup 在前,数据挂在后出现的名字下
+        d.extend(newc_entry(1, 0o100644, 2, 100, "a.txt", b""));
+        d.extend(newc_entry(1, 0o100644, 2, 100, "c.lnk", b"hello"));
+        d.extend(newc_entry(2, 0o100644, 1, 100, "b.txt", b"1234567890"));
+        d.extend(newc_entry(0, 0, 1, 0, "TRAILER!!!", b""));
+        while d.len() % 512 != 0 {
+            d.push(0);
+        }
+        let ents = parse_cpio(&d).unwrap();
+        let got: Vec<(&str, &str, u64)> = ents
+            .iter()
+            .map(|(e, _)| (e.name.as_str(), match e.kind {
+                EntryKind::File => "file",
+                EntryKind::HardLink => "hardlink",
+                _ => "?",
+            }, e.size))
+            .collect();
+        assert_eq!(got, vec![("a.txt", "hardlink", 0), ("c.lnk", "file", 5), ("b.txt", "file", 10)]);
+        let lt = &ents[0].0.link_target;
+        assert_eq!(lt.as_deref(), Some("c.lnk"));
     }
 }

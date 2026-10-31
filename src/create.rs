@@ -7,7 +7,7 @@
 //! 条目统一为内存模型 [`WriteEntry`](create 从磁盘读入;repack 从归档读出),
 //! 所有写后端消费同一结构。
 
-use std::io::{Read, Write};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use anyhow::bail;
