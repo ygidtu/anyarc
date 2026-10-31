@@ -121,6 +121,14 @@ pub struct Capabilities { read: bool, write: bool, password: bool, multi_volume:
 > (detect `Container::Gz`;复合 tar-in-gz 由 looks_tar 等价处理,`taz` 二跳自然退役)。
 > 回归:多成员/单成员/不同级别 gz 9 例全对;矩阵 81/19/0/30 不变;e2e OK=100;fuzz_headers 增 t.txt.gz 头区。
 
+> **M3-a 验收(2026-10-31)**:`repack`/`diff`/`search` 落地。create.rs 重构为内存条目模型
+> (`WriteEntry{File|Dir|Symlink}`+mode+mtime),repack 读 L1–L3 任意源(密码/env)写白名单目标;
+> 目标加密与源密码分离(`--encrypt`);7z 目标拒 symlink(7z 外部属性缺位)、全目标拒 hardlink/special(v1);
+> zip 写 mtime(civil_from_unix + MS-DOS 打包),7z 写 mtime(NtTime ticks);tar 全类型条目 append_data/append_link。
+> 实证:tgz→zip-AES→解回、p.zip→7z(env 密码)、gz→zst(sha 73475cb4…)、rar→tar、tar→tar.gz、
+> tar→zip(含 symlink)全部 diff 一致;diff 语义=条目名+sha256(0/1/2 退出),search=glob/子串(grep 退出)。
+> 修 diff/repack 循环 Dir/Symlink 未 skip 死循环(trait 契约:读或 skip 后才前进)。
+
 | L3 接 crate | lzma 单流(.lzma)、lzip(.lz)、lz4(.lz4) | lzma-rs(raw,MIT)+ lzma-rust2(LzipReader,Apache-2.0)+ lz4_flex(MIT);**bzip3 排除**(绑定 LGPL-3 C 库,转 Backlog) | **M2-b1 完成**(2026-10-31) |
 | L4 spec 重写 | udf、chm | 按公开规范纯 Rust 实现 | **Backlog 再议**(2026-10-30:需求弱,不排期)。2026-10-31:混合介质(ISO9660+UDF)已可按标准 AVDP(`BEA01VRS`@LBA256/512)与 genisoimage 内嵌指针(LBA18/19)识别,路由 Backlog 报错而非误走 ISO 解析) |
 | L5 音频容器 | flac(`claxon`)、ape(`mac`)、shn(`shorten`) | crate 接入,只读 | M3 |
@@ -135,9 +143,9 @@ pub struct Capabilities { read: bool, write: bool, password: bool, multi_volume:
 | `anyarc test [-v]` | 同上,只解码校验 CRC 不落盘 |
 | `anyarc list [-l/--json]` | 条目名/大小/时间/方法/加密标记;加密条目无密码也可列出(zip 中央目录明文;7z 头加密则 open 即要求密码)。注:`-t` 早期草拟,实际由 `-l` 覆盖 |
 | `anyarc create <out> <files>...` | **白名单**:tar(.gz/.bz2/.xz/.zst/.lzma/.lz/.lz4 及各缩写)、zip(deflate/WinZip AES-256)、7z(LZMA2)、单流 gz/bz2/xz/zst/lzma/lz/lz4(恰好 1 输入)。密码仅 zip AES(7zAES 编码器缺位→清晰报错);RAR 创建永久禁区;先写 `*.anyarc-tmp` 再 rename,无 `--overwrite` 拒绝覆盖。7z 26.04 实测互读:tar*/zip/7z/lzma ✓;`.lz/.lz4` 非我方缺陷(7z 格式表无 LZIP/LZ4) |
-| `anyarc repack <in> <out>` | in 按 L1–L3 读,out 按 create 白名单 |
-| `anyarc diff <a> <b>` | 条目名+内容哈希差异(v1);文本级 diff(v2) |
-| `anyarc search <pattern> <arch>...` | 条目名匹配(v1);解流内容 grep(v2) |
+| `anyarc repack <in> <out>` | in 按 L1–L3 读,out 按 create 白名单;源密码 `-p`/env,目标加密 `--encrypt`(仅 zip AES);hardlink/special 条目明确拒绝(v1) |
+| `anyarc diff <a> <b>` | 条目名+内容哈希差异(sha256;dir/link 按指纹);exit 0=一致 / 1=有差异 / 2=用法 |
+| `anyarc search <pattern> <arch>...` | 条目名匹配:`*`/`?` 走 glob,否则大小写敏感子串(`-i` 忽略);exit 0=命中 / 1=未命中(grep 语义) |
 | `anyarc formats` / `--version` | 能力表输出 |
 
 退出码:0 成功 / 1 运行时错误 / 2 用法错误;`-q/-v`  verbosity 与 patool 对齐;全局 `--json` 输出(list/search 机器可读)。

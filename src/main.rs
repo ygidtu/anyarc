@@ -7,6 +7,9 @@ fn main() {
         anyarc::cli::Cmd::Test(a) => run(anyarc::cli::cmd_test(&a)),
         anyarc::cli::Cmd::List(a) => run(anyarc::cli::cmd_list(&a)),
         anyarc::cli::Cmd::Create(a) => run(anyarc::cli::cmd_create(&a)),
+        anyarc::cli::Cmd::Diff(a) => run(anyarc::cli::cmd_diff(&a)),
+        anyarc::cli::Cmd::Search(a) => run(anyarc::cli::cmd_search(&a)),
+        anyarc::cli::Cmd::Repack(a) => run(anyarc::cli::cmd_repack(&a)),
         anyarc::cli::Cmd::Formats => run(anyarc::cli::cmd_formats()),
     };
     std::process::exit(code);

@@ -27,6 +27,12 @@ pub enum Cmd {
     List(ListArgs),
     /// 创建归档(白名单:tar 家族/zip/7z/单流压缩)
     Create(CreateArgs),
+    /// 比较两个归档(条目名+内容哈希)
+    Diff(DiffArgs),
+    /// 按条目名搜索归档(substring/glob)
+    Search(SearchArgs),
+    /// 转换归档格式(读任意支持格式,写 create 白名单)
+    Repack(RepackArgs),
     /// 打印格式支持表
     Formats,
 }
@@ -100,6 +106,54 @@ pub struct CreateArgs {
     #[arg(long)]
     pub overwrite: bool,
     /// 安静模式
+    #[arg(short = 'q', long)]
+    pub quiet: bool,
+}
+
+#[derive(clap::Args, Debug)]
+pub struct DiffArgs {
+    /// 两个归档(恰好 2 个)
+    pub archives: Vec<PathBuf>,
+    /// 密码(读加密归档用;两档共用)
+    #[arg(short = 'p', long)]
+    pub password: Option<String>,
+    /// 条目名编码修复
+    #[arg(short = 'e', long)]
+    pub encoding: Option<String>,
+    #[arg(short = 'q', long)]
+    pub quiet: bool,
+}
+
+#[derive(clap::Args, Debug)]
+pub struct SearchArgs {
+    /// 匹配式:含 * 或 ? 按 glob,否则子串匹配
+    pub pattern: String,
+    pub archives: Vec<PathBuf>,
+    #[arg(short = 'p', long)]
+    pub password: Option<String>,
+    #[arg(short = 'e', long)]
+    pub encoding: Option<String>,
+    /// 忽略大小写
+    #[arg(short = 'i', long)]
+    pub ignore_case: bool,
+    #[arg(short = 'q', long)]
+    pub quiet: bool,
+}
+
+#[derive(clap::Args, Debug)]
+pub struct RepackArgs {
+    /// 源归档(L1–L3 支持格式)
+    pub src: PathBuf,
+    /// 目标归档(格式由扩展名判定,create 白名单)
+    pub dst: PathBuf,
+    /// 密码(源为加密归档时必需;目标密码仅 zip AES)
+    #[arg(short = 'p', long)]
+    pub password: Option<String>,
+    /// 目标加密密码(与 -p 分开:解源/写目标可用同一 -p;此选项只作用于写)
+    #[arg(long)]
+    pub encrypt: Option<String>,
+    #[arg(long)]
+    pub overwrite: bool,
     #[arg(short = 'q', long)]
     pub quiet: bool,
 }
@@ -533,6 +587,156 @@ fn lookup_encoding(name: &str) -> anyhow::Result<&'static encoding_rs::Encoding>
         .ok_or_else(|| anyhow::anyhow!("未知编码标签: {name}(试试 gbk / big5 / shift_jis / windows-1251)"))
 }
 
+/// 归档内容摘要:条目名 → 值指纹(dir / link:target / special / sha256:hex)。
+/// 同名重复条目(追加式归档)若指纹不一致记为 "dup"。
+fn archive_digest(
+    path: &Path,
+    password: Option<String>,
+    enc: Option<&'static encoding_rs::Encoding>,
+    quiet: bool,
+) -> anyhow::Result<std::collections::BTreeMap<String, String>> {
+    use sha2::Digest as _;
+    let det = detect_with_warning(path, quiet)?;
+    let password = password.or_else(|| std::env::var("ANYARC_PASSWORD").ok().filter(|s| !s.is_empty()));
+    let opts = OpenOptions {
+        password,
+        verify_crc: true,
+        max_entry_size: Some(4 << 30),
+        ..Default::default()
+    };
+    let mut ar = backend::open(path, &det, &opts)?;
+    let mut map = std::collections::BTreeMap::new();
+    while let Some(e) = ar.next_entry()? {
+        let name = fixed_name(&e.name, enc);
+        let val = match e.kind {
+            EntryKind::Directory => "dir".to_string(),
+            EntryKind::Symlink | EntryKind::HardLink => format!("link:{}", e.link_target.clone().unwrap_or_default()),
+            EntryKind::Special => "special".to_string(),
+            EntryKind::File => {
+                let data = ar.read_current()?;
+                let mut h = sha2::Sha256::new();
+                h.update(&data);
+                let hex: String = h.finalize().iter().map(|b| format!("{b:02x}")).collect();
+                format!("sha256:{hex}")
+            }
+        };
+        match map.get(&name) {
+            None => {
+                map.insert(name, val);
+            }
+            Some(old) if *old != val => {
+                map.insert(name, "dup".into());
+            }
+            _ => {}
+        }
+        // File 分支已 read_current 消费;其余条目必须显式 skip 才能前进
+        if !matches!(e.kind, EntryKind::File) {
+            ar.skip_current()?;
+        }
+    }
+    Ok(map)
+}
+
+pub fn cmd_diff(args: &DiffArgs) -> anyhow::Result<u8> {
+    if args.archives.len() != 2 {
+        eprintln!("用法: anyarc diff <归档A> <归档B>");
+        return Ok(2);
+    }
+    let enc = args.encoding.as_deref().map(lookup_encoding).transpose()?;
+    let a = archive_digest(&args.archives[0], args.password.clone(), enc, args.quiet)?;
+    let b = archive_digest(&args.archives[1], args.password.clone(), enc, args.quiet)?;
+    let mut diffs = 0usize;
+    for (k, v) in a.iter().filter(|(k, _)| !b.contains_key(*k)) {
+        println!("只在 A: {k}");
+        let _ = v;
+        diffs += 1;
+    }
+    for (k, v) in b.iter().filter(|(k, _)| !a.contains_key(*k)) {
+        println!("只在 B: {k}");
+        let _ = v;
+        diffs += 1;
+    }
+    for (k, va) in &a {
+        if let Some(vb) = b.get(k)
+            && va != vb {
+                println!("内容不同: {k}");
+                diffs += 1;
+            }
+    }
+    if diffs == 0 {
+        if !args.quiet {
+            eprintln!("两个归档内容一致({} 个条目)", a.len());
+        }
+        Ok(0)
+    } else {
+        Ok(1) // 有差异(与 diff 命令语义一致)
+    }
+}
+
+/// 极简 glob(仅 `*` 与 `?`,迭代回溯);不含通配符时按子串。
+fn name_match(pattern: &str, name: &str, icase: bool) -> bool {
+    let (p, s) = if icase {
+        (pattern.to_lowercase(), name.to_lowercase())
+    } else {
+        (pattern.to_string(), name.to_string())
+    };
+    if !p.contains('*') && !p.contains('?') {
+        return s.contains(&p);
+    }
+    let pc: Vec<char> = p.chars().collect();
+    let sc: Vec<char> = s.chars().collect();
+    let (mut pi, mut si) = (0usize, 0usize);
+    let mut star: Option<usize> = None;
+    let mut star_si = 0usize;
+    while si < sc.len() {
+        if pi < pc.len() && (pc[pi] == '?' || pc[pi] == sc[si]) {
+            pi += 1;
+            si += 1;
+        } else if pi < pc.len() && pc[pi] == '*' {
+            star = Some(pi);
+            star_si = si;
+            pi += 1;
+        } else if let Some(sp) = star {
+            pi = sp + 1;
+            star_si += 1;
+            si = star_si;
+        } else {
+            return false;
+        }
+    }
+    while pi < pc.len() && pc[pi] == '*' {
+        pi += 1;
+    }
+    pi == pc.len()
+}
+
+pub fn cmd_search(args: &SearchArgs) -> anyhow::Result<u8> {
+    if args.archives.is_empty() {
+        eprintln!("用法: anyarc search <pattern> <归档>...");
+        return Ok(2);
+    }
+    let enc = args.encoding.as_deref().map(lookup_encoding).transpose()?;
+    let mut hits = 0usize;
+    for path in &args.archives {
+        let det = detect_with_warning(path, args.quiet)?;
+        let password = args.password.clone().or_else(|| std::env::var("ANYARC_PASSWORD").ok().filter(|s| !s.is_empty()));
+        let opts = OpenOptions {
+            password,
+            ..Default::default()
+        };
+        let mut ar = backend::open(path, &det, &opts)?;
+        while let Some(e) = ar.next_entry()? {
+            let name = fixed_name(&e.name, enc);
+            if name_match(&args.pattern, &name, args.ignore_case) {
+                println!("{}: {}", path.display(), name);
+                hits += 1;
+            }
+            ar.skip_current()?;
+        }
+    }
+    Ok(if hits > 0 { 0 } else { 1 }) // grep 语义:命中 0,未命中 1
+}
+
 pub fn cmd_create(args: &CreateArgs) -> anyhow::Result<u8> {
     if args.targets.len() < 2 {
         eprintln!("用法: anyarc create <输出归档> <文件/目录>...(格式白名单见 anyarc formats)");
@@ -550,6 +754,22 @@ pub fn cmd_create(args: &CreateArgs) -> anyhow::Result<u8> {
     })?;
     if !args.quiet {
         eprintln!("已创建 {}({} bytes)← {} 个输入条目", out.display(), n, inputs.len());
+    }
+    Ok(0)
+}
+
+pub fn cmd_repack(args: &RepackArgs) -> anyhow::Result<u8> {
+    let env_pw = std::env::var("ANYARC_PASSWORD").ok().filter(|s| !s.is_empty());
+    let password = args.password.as_deref().or(env_pw.as_deref());
+    let n = crate::create::repack(&crate::create::RepackOptions {
+        src: &args.src,
+        dst: &args.dst,
+        password,
+        write_password: args.encrypt.as_deref(),
+        overwrite: args.overwrite,
+    })?;
+    if !args.quiet {
+        eprintln!("已重打包 {} → {}({} bytes)", args.src.display(), args.dst.display(), n);
     }
     Ok(0)
 }
