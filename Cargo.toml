@@ -4,8 +4,7 @@ version = "0.1.0"
 edition = "2024"
 description = "Universal archive tool: extract/test/list/create, zero external dependencies"
 license = "MIT OR Apache-2.0"
-# TODO:发布前改为真实仓库地址(当前无 remote;dist 需要一个规范 URL)
-repository = "https://github.com/TODO/anyarc"
+repository = "https://github.com/ygidtu/anyarc"
 
 [lib]
 name = "anyarc"
