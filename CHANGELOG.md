@@ -18,6 +18,9 @@
 - M4-c 递归解压 `extract --recursive/-r`:解出的文件若仍是可识别归档则就地
   继续向内解压、移除中间归档,一次性直达最内层叶子(如 zip→tar.gz→tar→leaf);
   按内容探测停叶子,深度上限 16 层 + 自引用/自嵌条目跳过防护(流式读会截断自身源)
+- M4-c+ macOS 打包自动剔除垃圾文件:`create`/`repack` 在 macOS 运行时默认跳过
+  Finder 元数据 `.DS_Store` 与 AppleDouble 伴生文件 `._*`(目录整棵不下探;
+  显式传入的路径同样剔除);predicate 跨平台可测,Linux/CI 对拍行为不变
 - M4 发布工程:
   - `anyarc completions <bash|zsh|fish|elvish|powershell>` 生成 shell 补全脚本
   - `anyarc man` 输出 roff man page(`anyarc man | man -l -`)

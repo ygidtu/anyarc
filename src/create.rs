@@ -122,6 +122,20 @@ pub enum WriteKind {
     Symlink(String),
 }
 
+/// macOS 打包垃圾名:Finder 目录元数据 `.DS_Store` 与 AppleDouble 伴生文件 `._*`。
+/// 按条目名 basename 判定(归档条目名用 `/`;Windows `\` 一并兼容)。
+/// 仅在 macOS 运行时由调用点启用(cfg 门控),predicate 跨平台可测。
+pub fn is_macos_junk_name(name: &str) -> bool {
+    let base = name.rsplit(['/', '\\']).next().unwrap_or(name);
+    base == ".DS_Store" || base.starts_with("._")
+}
+
+/// 磁盘路径是否为打包应自动跳过的 macOS 垃圾(仅 macOS 生效)。
+fn is_macos_junk_path(p: &std::path::Path) -> bool {
+    cfg!(target_os = "macos")
+        && p.file_name().is_some_and(|n| is_macos_junk_name(&n.to_string_lossy()))
+}
+
 #[derive(Debug, Clone)]
 pub struct WriteEntry {
     pub name: String, // 目录以 '/' 结尾
@@ -142,6 +156,9 @@ fn plan_entries_with_map(inputs: &[PathBuf]) -> anyhow::Result<(Vec<WriteEntry>,
     let mut out = Vec::new();
     let mut map: Vec<Option<PathBuf>> = Vec::new();
     for p in inputs {
+        if is_macos_junk_path(p) {
+            continue; // 显式传入的 macOS 垃圾也自动跳过(仅 macOS)
+        }
         let meta = std::fs::symlink_metadata(p)
             .map_err(|_| anyhow::anyhow!("输入不存在:{}", p.display()))?;
         if meta.is_dir() {
@@ -154,6 +171,9 @@ fn plan_entries_with_map(inputs: &[PathBuf]) -> anyhow::Result<(Vec<WriteEntry>,
             while let Some(d) = stack.pop() {
                 for e in std::fs::read_dir(&d)? {
                     let epath = e?.path();
+                    if is_macos_junk_path(&epath) {
+                        continue; // .DS_Store / ._*(含同名目录整棵):不落条目也不下探
+                    }
                     let em = std::fs::symlink_metadata(&epath)?;
                     let rel = format!("{root}/{}", arc_name(&base, &epath));
                     if em.is_dir() {
@@ -602,6 +622,11 @@ pub fn repack(opts: &RepackOptions) -> anyhow::Result<u64> {
     let mut entries = Vec::new();
     while let Some(e) = ar.next_entry()? {
         bar.message(e.name.clone());
+        if cfg!(target_os = "macos") && is_macos_junk_name(&e.name) {
+            // macOS 上跨格式转换同样剔除 Finder/AppleDouble 垃圾条目
+            ar.skip_current()?;
+            continue;
+        }
         // File 分支的 read_current 会消费条目;其余必须显式 skip 才能前进
         let consumed = matches!(e.kind, crate::backend::EntryKind::File);
         let kind = match e.kind {
@@ -706,5 +731,46 @@ mod tests {
         // zip epoch 前钳制
         let (y, ..) = civil_from_unix(0);
         assert!(y <= 1980);
+    }
+
+    #[test]
+    fn macos_junk_name_predicate() {
+        assert!(is_macos_junk_name(".DS_Store"));
+        assert!(is_macos_junk_name("photos/.DS_Store"));
+        assert!(is_macos_junk_name("._photo.jpg")); // AppleDouble 伴生
+        assert!(is_macos_junk_name("__MACOSX/._photo.jpg"));
+        assert!(is_macos_junk_name("dir\\._x")); // 反斜杠分隔兼容
+        assert!(!is_macos_junk_name("photo.jpg"));
+        assert!(!is_macos_junk_name("a.DS_Store")); // 精确名才算
+        assert!(!is_macos_junk_name("_dir/file")); // 单下划线不是
+        assert!(!is_macos_junk_name("dot._")); // "._" 前缀须在开头
+        assert!(!is_macos_junk_name("正常中文._后缀")); // ._ 不在开头
+    }
+
+    #[test]
+    fn junk_skipping_only_on_macos() {
+        let dir = std::env::temp_dir().join(format!("anyarc_junk_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        std::fs::write(dir.join(".DS_Store"), b"junk").unwrap(); // 顶层垃圾
+        std::fs::write(dir.join("._file"), b"junk").unwrap(); // AppleDouble
+        std::fs::write(dir.join("sub/.DS_Store"), b"junk").unwrap(); // 嵌套垃圾
+        std::fs::write(dir.join("real.txt"), b"data").unwrap();
+        std::fs::write(dir.join("keep._txt"), b"data").unwrap(); // "._" 不在开头:保留
+        let (entries, _) = plan_entries_with_map(std::slice::from_ref(&dir)).unwrap();
+        let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
+        let junk = |n: &str| is_macos_junk_name(n);
+        if cfg!(target_os = "macos") {
+            assert!(!names.iter().any(|n| junk(n)), "macOS 应剔除垃圾条目:{names:?}");
+            assert!(names.iter().any(|n| n.ends_with("/real.txt")));
+            assert!(names.iter().any(|n| n.ends_with("/keep._txt")));
+        } else {
+            // 非 macOS(cfg 门控):垃圾名照常收集,既有对拍行为不变
+            assert!(names.iter().any(|n| n.ends_with("/.DS_Store")), "{names:?}");
+            assert!(names.iter().any(|n| n.ends_with("/._file")));
+            assert!(names.iter().any(|n| n.ends_with("keep._txt")));
+            assert!(names.iter().any(|n| n.ends_with("/real.txt")));
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }
