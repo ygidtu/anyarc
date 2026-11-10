@@ -114,6 +114,9 @@ impl ArchiveBackend for ContainerBackend {
         // 单流压缩(gz/lzma/lzip/lz4)非 tar 复合、音频解码 → 计划里只有一个文件条目
         self.plan.len() == 1 && self.plan[0].0.kind == EntryKind::File
     }
+    fn provides_mode(&self) -> bool {
+        true // plan_tar/cpio/ar 构造已填 mode;iso/单流/音频为 None(无来源),边信道对它们也是空
+    }
     /// 真流式:压缩成员边解压边分块写 w(限额用 take(cap+1) 检出超限)。
     fn read_current_to(&mut self, w: &mut dyn Write) -> anyhow::Result<u64> {
         let i = self.current.take().ok_or_else(|| anyhow::anyhow!("无当前条目"))?;
@@ -375,6 +378,7 @@ pub fn open(path: &Path, det: &Detected, opts: &OpenOptions) -> anyhow::Result<B
                         mtime_epoch: None,
                         encrypted: false,
                         link_target: None,
+                        mode: None, // 单流压缩格式不存权限
                     },
                     Fetch::Comp { off: 0, len: data.len() as u64, comp },
                 )]
@@ -398,6 +402,7 @@ pub fn open(path: &Path, det: &Detected, opts: &OpenOptions) -> anyhow::Result<B
                     mtime_epoch: None,
                     encrypted: false,
                     link_target: None,
+                    mode: None,
                 },
                 Fetch::Inline(bytes),
             )]
@@ -508,6 +513,7 @@ fn parse_ar(data: &[u8]) -> anyhow::Result<Vec<(Entry, u64, u64)>> {
                     mtime_epoch: (mtime > 0).then_some(mtime),
                     encrypted: false,
                     link_target: None,
+                    mode: Some(mode & 0o7777),
                 },
                 (body + name_extra) as u64,
                 (size - name_extra) as u64,
@@ -538,6 +544,7 @@ fn parse_deb(data: &[u8]) -> anyhow::Result<Vec<(Entry, Fetch)>> {
                     method: method.into(),
                     mtime_epoch: None,
                     encrypted: false,
+                    mode: None, // 外层虚拟条目;内层 tar 成员各自带 mode
                     link_target: None,
                 };
                 let fetch = match fetch {
@@ -642,6 +649,7 @@ fn parse_rpm(data: &[u8]) -> anyhow::Result<Vec<(Entry, Fetch)>> {
         mtime_epoch: None,
         encrypted: false,
         link_target: None,
+        mode: None, // 外层虚拟条目;内层 cpio 成员各自带 mode
     };
     Ok(vec![(entry, Fetch::Comp { off: payload_off as u64, len: (data.len() - payload_off) as u64, comp })])
 }
@@ -662,6 +670,9 @@ fn read_region(data: &[u8], at: usize) -> anyhow::Result<(usize, usize)> {
 fn parse_cpio(data: &[u8]) -> anyhow::Result<Vec<(Entry, Fetch)>> {
     if data.starts_with(b"070701") || data.starts_with(b"070702") {
         return parse_cpio_newc(data);
+    }
+    if data.len() < 6 {
+        anyhow::bail!("cpio: 输入过短(非 newc 文本头且不足二进制魔数)");
     }
     // 二进制 cpio:0707(bin)/ 070707(hpbin),16 位字段 LE/BE
     match data[..2] {
@@ -745,6 +756,7 @@ fn parse_cpio_newc(data: &[u8]) -> anyhow::Result<Vec<(Entry, Fetch)>> {
                 mtime_epoch: (mtime > 0).then_some(mtime as u64),
                 encrypted: false,
                 link_target,
+                mode: Some(mode & 0o7777),
             },
             fetch,
         ));
@@ -854,6 +866,7 @@ fn parse_cpio_bin(data: &[u8], be: bool, hp: bool) -> anyhow::Result<Vec<(Entry,
                     EntryKind::HardLink => by_ino.get(&ino).cloned(),
                     _ => None,
                 },
+                mode: Some((u32::from(mode)) & 0o7777),
             },
             fetch,
         ));
@@ -952,7 +965,7 @@ fn parse_iso(data: &[u8]) -> anyhow::Result<Vec<(Entry, Fetch)>> {
             let full = if prefix.is_empty() { name.clone() } else { format!("{prefix}/{name}") };
             if flags & 2 != 0 {
                 out.push((
-                    Entry { name: full.clone(), kind: EntryKind::Directory, size: 0, compressed_size: 0, method: "ISO".into(), mtime_epoch: None, encrypted: false, link_target: None },
+                    Entry { name: full.clone(), kind: EntryKind::Directory, size: 0, compressed_size: 0, method: "ISO".into(), mtime_epoch: None, encrypted: false, link_target: None, mode: None },
                     Fetch::Inline(Vec::new()),
                 ));
                 stack.push((ext, sz, full));
@@ -967,6 +980,7 @@ fn parse_iso(data: &[u8]) -> anyhow::Result<Vec<(Entry, Fetch)>> {
                         mtime_epoch: None,
                         encrypted: false,
                         link_target: None,
+                        mode: None, // ISO9660 无 unix 权限语义
                     },
                     Fetch::Raw { off: (ext.saturating_mul(sector)) as u64, len: sz as u64 },
                 ));
@@ -1074,9 +1088,9 @@ fn plan_tar(bytes: &[u8]) -> anyhow::Result<Vec<(Entry, Fetch)>> {
         if out.len() >= MAX_ENTRIES {
             break;
         }
-        let (et, size, mtime) = {
+        let (et, size, mtime, mode) = {
             let h = e.header();
-            (h.entry_type(), h.size().unwrap_or(0), h.mtime().ok())
+            (h.entry_type(), h.size().unwrap_or(0), h.mtime().ok(), h.mode().ok())
         };
         let name = e.path()?.to_string_lossy().into_owned();
         if name.is_empty() {
@@ -1115,6 +1129,7 @@ fn plan_tar(bytes: &[u8]) -> anyhow::Result<Vec<(Entry, Fetch)>> {
                 mtime_epoch: mtime,
                 encrypted: false,
                 link_target,
+                mode,
             },
             Fetch::Inline(data),
         ));

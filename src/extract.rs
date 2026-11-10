@@ -1,5 +1,6 @@
-//! 安全落盘:Zip-slip 防护、符号链接逃逸检查、覆盖策略、进度输出。
+//! 安全落盘:Zip-slip 防护、符号链接逃逸检查、覆盖策略、权限还原、进度输出。
 
+use std::collections::HashMap;
 use std::io::IsTerminal;
 use std::path::{Component, Path, PathBuf};
 
@@ -69,4 +70,209 @@ fn lexically_normalize(p: &Path) -> PathBuf {
 
 pub fn is_tty() -> bool {
     std::io::stdout().is_terminal()
+}
+
+// ---------------------------------------------------------------- 权限还原
+
+/// 条目名归一(边信道 map 键):`\`→`/`、去 `./` 前缀与尾部 `/`。
+pub fn norm_entry_name(name: &str) -> String {
+    let s = name.replace('\\', "/");
+    s.trim_start_matches("./").trim_end_matches('/').to_string()
+}
+
+/// 落盘后还原归档内权限位(仅 unix;失败静默忽略,如只读 FS)。
+/// mode==0(工具退化数据)跳过,避免把文件 chmod 成不可访问。
+pub fn set_mode(p: &Path, mode: Option<u32>) {
+    #[cfg(unix)]
+    if let Some(m) = mode.filter(|m| *m & 0o7777 != 0) {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(p, std::fs::Permissions::from_mode(m & 0o7777));
+    }
+    #[cfg(not(unix))]
+    let _ = (p, mode);
+}
+
+/// --overwrite 再解时,上次还原的只读 mode(0444 等)会让 File::create 报
+/// EACCES;写前补回 owner 写权限。
+pub fn ensure_writable(p: &Path) {
+    #[cfg(unix)]
+    if let Ok(md) = std::fs::metadata(p) {
+        use std::os::unix::fs::PermissionsExt;
+        let m = md.permissions().mode();
+        if m & 0o200 == 0 {
+            let _ = std::fs::set_permissions(p, std::fs::Permissions::from_mode(m | 0o200));
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = p;
+}
+
+/// unarc-rs 0.8.1 不暴露 unix mode:对可直读 header 的格式建 name→mode
+/// 边信道(zip 中央目录 external_attr;tar 家族流式扫 512B 头部)。
+pub fn mode_map(path: &Path, det: &crate::detect::Detected) -> HashMap<String, u32> {
+    use unarc_rs::unified::ArchiveFormat as F;
+    let f = match std::fs::File::open(path) {
+        Ok(f) => f,
+        Err(_) => return HashMap::new(),
+    };
+    let br = std::io::BufReader::new(f);
+    match det.kind {
+        crate::detect::Known::Unarc(F::Zip | F::Jar) => zip_modes(path).unwrap_or_default(),
+        crate::detect::Known::Unarc(F::Tar) => tar_mode_scan(br),
+        crate::detect::Known::Unarc(F::Tgz) => tar_mode_scan(flate2::read::MultiGzDecoder::new(br)),
+        crate::detect::Known::Unarc(F::Tbz) => tar_mode_scan(bzip2::read::BzDecoder::new(br)),
+        crate::detect::Known::Unarc(F::Tzst) => match zstd::stream::read::Decoder::new(br) {
+            Ok(d) => tar_mode_scan(d),
+            Err(_) => HashMap::new(),
+        },
+        crate::detect::Known::Unarc(F::Txz) => {
+            // 借用 unarc 的 XZ 解码(无 Read 包装):整读后扫(tar 尺寸受上限约束)
+            match unarc_rs::xz::XzArchive::new(br).and_then(|mut a| a.read_with_limit(Some(1 << 31))) {
+                Ok(v) => tar_mode_scan(std::io::Cursor::new(v)),
+                Err(_) => HashMap::new(),
+            }
+        }
+        _ => HashMap::new(),
+    }
+}
+
+fn rfind_sig(buf: &[u8], sig: u32) -> Option<usize> {
+    let s = sig.to_le_bytes();
+    (0..=buf.len().checked_sub(4)?).rev().find(|&i| buf[i..i + 4] == s)
+}
+
+fn zip_modes(path: &Path) -> std::io::Result<HashMap<String, u32>> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut f = std::fs::File::open(path)?;
+    let len = f.metadata()?.len();
+    if len < 22 {
+        return Ok(HashMap::new());
+    }
+    // EOCD(PK\x05\x06)位于尾部 22..64KiB+22 区间内
+    let tail_len = std::cmp::min(len, 22 + 65535);
+    let mut tail = vec![0u8; tail_len as usize];
+    f.seek(SeekFrom::Start(len - tail_len))?;
+    f.read_exact(&mut tail)?;
+    let eocd = rfind_sig(&tail, 0x0605_4b50).ok_or_else(|| std::io::Error::other("no EOCD"))?;
+    let e = &tail[eocd..eocd + 22];
+    let mut entries = u16::from_le_bytes(e[10..12].try_into().unwrap()) as u64;
+    let mut cd_size = u32::from_le_bytes(e[12..16].try_into().unwrap()) as u64;
+    let mut cd_off = u32::from_le_bytes(e[16..20].try_into().unwrap()) as u64;
+    // zip64:哨兵值 → 经 EOCD64 locator(PK\x06\x07,EOCD 前 20B)跳读
+    if (cd_off == 0xFFFF_FFFF || cd_size == 0xFFFF_FFFF || entries == 0xFFFF)
+        && eocd >= 20
+        && rfind_sig(&tail[eocd - 20..eocd], 0x0706_4b50).is_some()
+    {
+        let loc = &tail[eocd - 20 + 8..eocd - 20 + 16];
+        let z64_off = u64::from_le_bytes(loc.try_into().unwrap());
+        let mut z = [0u8; 56];
+        f.seek(SeekFrom::Start(z64_off))?;
+        f.read_exact(&mut z)?;
+        if &z[0..4] == b"PK\x06\x06" {
+            entries = u64::from_le_bytes(z[32..40].try_into().unwrap());
+            cd_size = u64::from_le_bytes(z[40..48].try_into().unwrap());
+            cd_off = u64::from_le_bytes(z[48..56].try_into().unwrap());
+        }
+    }
+    // 中央目录逐条:46B 定长 + name/extra/comment;made-by 高字节 3=unix 时
+    // mode = external_attr 高 16 位
+    let mut cd = vec![0u8; cd_size.min(64 << 20) as usize];
+    f.seek(SeekFrom::Start(cd_off))?;
+    f.read_exact(&mut cd)?;
+    let mut map = HashMap::new();
+    let (mut i, mut n) = (0usize, 0u64);
+    while i + 46 <= cd.len() && n < entries {
+        if &cd[i..i + 4] != b"PK\x01\x02" {
+            break;
+        }
+        // made_by u16 LE:+4=zip 规范版本低字节,+5=生成系统高字节(3=unix)
+        let made_by_unix = cd[i + 5] == 3;
+        let name_len = u16::from_le_bytes(cd[i + 28..i + 30].try_into().unwrap()) as usize;
+        let extra_len = u16::from_le_bytes(cd[i + 30..i + 32].try_into().unwrap()) as usize;
+        let cmt_len = u16::from_le_bytes(cd[i + 32..i + 34].try_into().unwrap()) as usize;
+        if made_by_unix {
+            let attr = u32::from_le_bytes(cd[i + 38..i + 42].try_into().unwrap());
+            let mode = attr >> 16 & 0o7777;
+            // mode=0(工具未填 unix attr 的退化情形)不还原:会让文件不可访问
+            let name = String::from_utf8_lossy(&cd[i + 46..i + 46 + name_len]).into_owned();
+            let key = norm_entry_name(&name);
+            if mode != 0 && !key.is_empty() {
+                map.insert(key, mode);
+            }
+        }
+        i += 46 + name_len + extra_len + cmt_len;
+        n += 1;
+    }
+    Ok(map)
+}
+
+/// 流式扫 tar 头(只过 header,不读数据块内容由 tar crate skip 处理)。
+fn tar_mode_scan<R: std::io::Read>(r: R) -> HashMap<String, u32> {
+    let mut ar = tar::Archive::new(r);
+    let mut map = HashMap::new();
+    if let Ok(entries) = ar.entries() {
+        for e in entries.flatten() {
+            let mode = e.header().mode().ok().map(|m| m & 0o7777);
+            let name = e.path().map(|p| p.to_string_lossy().into_owned()).unwrap_or_default();
+            let key = norm_entry_name(&name);
+            if let (Some(m), false) = (mode.filter(|m| *m != 0), key.is_empty()) {
+                map.insert(key, m);
+            }
+        }
+    }
+    map
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn norm_entry_name_strips_prefix_slash_and_dots() {
+        assert_eq!(norm_entry_name("./a/b.txt"), "a/b.txt");
+        assert_eq!(norm_entry_name("dir/"), "dir");
+        assert_eq!(norm_entry_name("win\\path.x"), "win/path.x");
+        assert_eq!(norm_entry_name("./"), "");
+    }
+
+    #[test]
+    fn zip_modes_reads_unix_external_attrs() {
+        // 用 zip crate 造:unix 755 文件 + unix 目录 + dos-made 文件(应缺席)
+        let path = std::env::temp_dir().join(format!("anyarc_zipmode_{}.zip", std::process::id()));
+        let mut zw = zip::ZipWriter::new(std::fs::File::create(&path).unwrap());
+        let unix_opts: zip::write::FileOptions<'_, '_, ()> =
+            zip::write::FileOptions::default().unix_permissions(0o755);
+        zw.start_file("bin/tool", unix_opts).unwrap();
+        std::io::Write::write_all(&mut zw, b"#!/bin/sh\n").unwrap();
+        let dir_opts: zip::write::FileOptions<'_, '_, ()> =
+            zip::write::FileOptions::default().unix_permissions(0o755);
+        zw.add_directory("scripts/", dir_opts).unwrap();
+        let dos_opts: zip::write::FileOptions<'_, '_, ()> = zip::write::FileOptions::default(); // made_by=dos
+        zw.start_file("dos.txt", dos_opts).unwrap();
+        std::io::Write::write_all(&mut zw, b"x").unwrap();
+        zw.finish().unwrap();
+        let m = zip_modes(&path).unwrap();
+        assert_eq!(m.get("bin/tool"), Some(&0o755));
+        assert_eq!(m.get("scripts"), Some(&0o755)); // 目录尾斜杠已归一
+        // zip crate 默认 unix-made 且带 0o644:如实读出(真 attr=0 退化条目由 mode!=0 过滤,e2e 覆盖)
+        assert_eq!(m.get("dos.txt"), Some(&0o644));
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn tar_modes_reads_header_mode() {
+        let path = std::env::temp_dir().join(format!("anyarc_tarmode_{}.tar", std::process::id()));
+        {
+            let mut tb = tar::Builder::new(std::fs::File::create(&path).unwrap());
+            let mut h = tar::Header::new_gnu();
+            h.set_size(4);
+            h.set_mode(0o700);
+            h.set_cksum();
+            tb.append_data(&mut h, "./exec.sh", &b"cmd\n"[..]).unwrap();
+            tb.finish().unwrap();
+        }
+        let m = tar_mode_scan(std::fs::File::open(&path).unwrap());
+        assert_eq!(m.get("exec.sh"), Some(&0o700)); // "./" 前缀已归一
+        std::fs::remove_file(&path).unwrap();
+    }
 }

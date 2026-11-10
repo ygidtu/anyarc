@@ -82,6 +82,9 @@ fn to_entry(e: &ArchiveEntry) -> Entry {
         mtime_epoch: e.modified_time().map(dos_epoch),
         encrypted: e.encryption() != EncryptionMethod::None,
         link_target: e.link_target().map(|t| t.replace('\\', "/")),
+        // unarc-rs 0.8.1 的 ArchiveEntry 不提供 unix mode;
+        // zip/tar 由 extract 的边信道(header 直读)补齐,其余格式保持默认
+        mode: None,
     }
 }
 

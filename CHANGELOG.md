@@ -30,6 +30,13 @@
 - `poc/e2e.sh`:133 fixture CLI 端到端冒烟固化脚本
 
 ### 修复
+- 解压落盘不还原归档权限位(`.sh`/可执行脚本解出变 644):`Entry` 新增
+  `mode` 字段,自写容器(tar/cpio/ar)从头部直填;unarc 后端(不提供 mode)
+  经 header 边信道补齐 — zip 中央目录 external_attr(含 zip64)、tar 家族
+  流式扫头部(Tgz/Tbz/Tzst/Txz 复合流多一次外层解码,自写容器则跳过);
+  mode==0 退化数据不还原防 000 不可访问,--overwrite 重写前自动补写位;
+  repack 目标归档同样携带源 mode(目录默认 755)
+- 空/截断 cpio 输入 panic(index out of range)改为报错退出
 - 多成员 gzip 解压(unarc-rs 0.8.1 缺陷)改走自写 MultiGzDecoder(flate2)
 - cpio newc 硬链接条目两阶段 (dev,ino) 归并
 

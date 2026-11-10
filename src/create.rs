@@ -652,7 +652,14 @@ pub fn repack(opts: &RepackOptions) -> anyhow::Result<u64> {
                 WriteKind::File(ar.read_current()?)
             }
         };
-        entries.push(WriteEntry { name: e.name, kind, mode: 0o644, mtime: e.mtime_epoch });
+        let default_mode = if matches!(kind, WriteKind::Dir) { 0o755 } else { 0o644 };
+        entries.push(WriteEntry {
+            name: e.name,
+            kind,
+            // 源有 mode(cpio/ar/tar 自写解析)直接携带;否则按类型给合理默认
+            mode: e.mode.unwrap_or(default_mode),
+            mtime: e.mtime_epoch,
+        });
         bar.inc();
         if !consumed {
             ar.skip_current()?;

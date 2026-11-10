@@ -82,6 +82,8 @@ pub struct Entry {
     pub mtime_epoch: Option<u64>,
     pub encrypted: bool,
     pub link_target: Option<String>,
+    /// unix 权限位(0o7777 低 12 位);None = 归档格式不提供(保持 umask 默认)
+    pub mode: Option<u32>,
 }
 
 /// 打开归档的选项(限额、密码、CRC 校验)。
@@ -126,6 +128,11 @@ pub trait ArchiveBackend {
     fn skip_current(&mut self) -> anyhow::Result<()>;
     /// 单文件作业(单流压缩,解压产物恰为一个文件):extract 用 pv 风格进度条。
     fn is_single_file(&self) -> bool {
+        false
+    }
+    /// 条目是否自带 unix mode(自写容器 true;unarc 后端 false → extract 走
+    /// header 边信道补 mode,对复合流(tgz 等)意味着一次额外解压扫描)。
+    fn provides_mode(&self) -> bool {
         false
     }
     /// 流式把当前条目解压数据写入 w,返回写入字节数。

@@ -342,7 +342,13 @@ pub fn cmd_extract(args: &ExtractArgs) -> anyhow::Result<u8> {
     for path in &args.common.archives {
         let det = detect_with_warning(path, args.common.quiet)?;
         let mut ar = open_verified(path, &det, &args.common)?;
-        match extract_one(ar.as_mut(), path, args, enc, &args.out, false) {
+        // 后端不提供 mode 时走 header 边信道(zip 中央目录/tar 家族流扫描)补齐
+        let modes = if ar.provides_mode() {
+            Default::default()
+        } else {
+            crate::extract::mode_map(path, &det)
+        };
+        match extract_one(ar.as_mut(), path, args, enc, &args.out, false, &modes) {
             Err(e) => {
                 eprintln!("错误: {}: {e:#}", path.display());
                 failures += 1;
@@ -375,8 +381,14 @@ fn peel_nested(files: &[PathBuf], args: &ExtractArgs, enc: Option<&'static encod
             _ => continue,
         };
         let dest = f.parent().unwrap_or(Path::new(".")).to_path_buf();
-        let extracted = open_verified(f, &det, &args.common)
-            .and_then(|mut ar| extract_one(ar.as_mut(), f, args, enc, &dest, true));
+        let extracted = open_verified(f, &det, &args.common).and_then(|mut ar| {
+            let modes = if ar.provides_mode() {
+                Default::default()
+            } else {
+                crate::extract::mode_map(f, &det)
+            };
+            extract_one(ar.as_mut(), f, args, enc, &dest, true, &modes)
+        });
         match extracted {
             Ok(inner) if !inner.is_empty() => {
                 // 解出真实内容才移除中间归档;空产物(被覆盖策略跳过等)保留原文件
@@ -403,6 +415,7 @@ fn extract_one(
     enc: Option<&'static encoding_rs::Encoding>,
     dest: &Path,
     nested: bool,
+    modes: &std::collections::HashMap<String, u32>,
 ) -> anyhow::Result<Vec<PathBuf>> {
     std::fs::create_dir_all(dest)?;
     let single = ar.is_single_file();
@@ -424,6 +437,8 @@ fn extract_one(
                 if let Some(p) = safe_join(dest, &name) {
                     if !single {
                         std::fs::create_dir_all(&p)?;
+                        let m = entry.mode.or_else(|| modes.get(&crate::extract::norm_entry_name(&name)).copied());
+                        crate::extract::set_mode(&p, m);
                         n_dir += 1;
                     }
                 } else {
@@ -457,6 +472,7 @@ fn extract_one(
                 if let Some(parent) = p.parent() {
                     std::fs::create_dir_all(parent)?;
                 }
+                crate::extract::ensure_writable(&p); // 上次还原的只读 mode 不挡住重写
                 let mut f = std::fs::File::create(&p)?;
                 if single {
                     // pv 风格:总长已知 → 进度条+百分比+ETA;未知 → 字节+速率+用时。
@@ -470,6 +486,9 @@ fn extract_one(
                     ar.read_current_to(&mut w)?;
                     drop(w);
                 }
+                drop(f);
+                let m = entry.mode.or_else(|| modes.get(&crate::extract::norm_entry_name(&name)).copied());
+                crate::extract::set_mode(&p, m);
                 n_file += 1;
                 written.push(p);
             }
@@ -545,10 +564,14 @@ fn extract_one(
                     if let Some(parent) = p.parent() {
                         std::fs::create_dir_all(parent)?;
                     }
+                    crate::extract::ensure_writable(&p);
                     let mut f = std::fs::File::create(&p)?;
                     let mut w = bar.wrap(&mut f);
                     ar.read_current_to(&mut w)?;
                     drop(w);
+                    drop(f);
+                    let m = entry.mode.or_else(|| modes.get(&crate::extract::norm_entry_name(&name)).copied());
+                    crate::extract::set_mode(&p, m);
                     n_file += 1;
                     written.push(p);
                 }
