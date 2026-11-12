@@ -6,6 +6,7 @@
 //! - 吸收 unarc 实测坑:目录/不读的条目必须显式 skip,否则 tar 类后端死循环;
 //! - ACE/CAB 内部 `\` 分隔符 → 统一归一化为 `/`。
 
+pub mod rar;
 pub mod unarc;
 
 use std::path::Path;
@@ -134,6 +135,11 @@ pub trait ArchiveBackend {
     /// header 边信道补 mode,对复合流(tgz 等)意味着一次额外解压扫描)。
     fn provides_mode(&self) -> bool {
         false
+    }
+    /// 归档解压后总字节数(可在不解压的情况下枚举条目时提供):
+    /// extract 进度条据此显示 进度条/百分比/ETA;None = 未知(spinner 模式)。
+    fn total_uncompressed(&self) -> Option<u64> {
+        None
     }
     /// 流式把当前条目解压数据写入 w,返回写入字节数。
     /// 可流式的后端应覆盖(边解压边推进度);默认整读后分块写。

@@ -21,6 +21,15 @@
 - M4-c+ macOS 打包自动剔除垃圾文件:`create`/`repack` 在 macOS 运行时默认跳过
   Finder 元数据 `.DS_Store` 与 AppleDouble 伴生文件 `._*`(目录整棵不下探;
   显式传入的路径同样剔除);predicate 跨平台可测,Linux/CI 对拍行为不变
+- M5 RAR 真流式后端(rars crate):绕开 unarc unified 的 Rar read 整档解码
+  + 全量缓存缺陷(solid/分卷大档必然 OOM;unarc 打开分卷时还会整卷进内存)。
+  回调式流式解码直写输出流,内存 O(解码窗口);成员头预枚举 → RAR 单条目
+  大档(3GB+)走 pv 全功能进度条,多条目走 进度条+百分比+ETA;
+  unix 权限从头解析(RAR5 host_os=1 / legacy=3)。
+  限制:solid 多成员逐条提取为 O(n²) 重扫描(单条目场景无影响);
+  RAR5 symlink/hardlink(redirection)按特殊条目跳过
+- M5+ `extract` 递归默认开启(zip→tar.gz→tar→leaf 一次直达最内层,
+  中间归档移除),`--no-recursive` 关闭;`-r` 保留为兼容旗标
 - M4 发布工程:
   - `anyarc completions <bash|zsh|fish|elvish|powershell>` 生成 shell 补全脚本
   - `anyarc man` 输出 roff man page(`anyarc man | man -l -`)
@@ -30,6 +39,8 @@
 - `poc/e2e.sh`:133 fixture CLI 端到端冒烟固化脚本
 
 ### 修复
+- RAR 分卷名收集:RAR5 新式 `stem.partNNN.rar` 漏了 `part` 段(此前只会
+  收到首卷,跨卷成员直接报错)
 - 解压落盘不还原归档权限位(`.sh`/可执行脚本解出变 644):`Entry` 新增
   `mode` 字段,自写容器(tar/cpio/ar)从头部直填;unarc 后端(不提供 mode)
   经 header 边信道补齐 — zip 中央目录 external_attr(含 zip64)、tar 家族

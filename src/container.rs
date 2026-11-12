@@ -117,6 +117,9 @@ impl ArchiveBackend for ContainerBackend {
     fn provides_mode(&self) -> bool {
         true // plan_tar/cpio/ar 构造已填 mode;iso/单流/音频为 None(无来源),边信道对它们也是空
     }
+    fn total_uncompressed(&self) -> Option<u64> {
+        Some(self.plan.iter().map(|(e, _)| e.size).sum())
+    }
     /// 真流式:压缩成员边解压边分块写 w(限额用 take(cap+1) 检出超限)。
     fn read_current_to(&mut self, w: &mut dyn Write) -> anyhow::Result<u64> {
         let i = self.current.take().ok_or_else(|| anyhow::anyhow!("无当前条目"))?;

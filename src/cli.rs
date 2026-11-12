@@ -86,9 +86,12 @@ pub struct ExtractArgs {
     /// 输出目录(默认当前目录)
     #[arg(short = 'o', long, default_value = ".")]
     pub out: PathBuf,
-    /// 递归解压:解出的文件若仍是可识别归档,继续向内解一层(中间归档移除)
+    /// 递归解压(默认开启;此旗标为兼容保留,显式传入无额外效果)
     #[arg(short = 'r', long)]
     pub recursive: bool,
+    /// 关闭递归解压(只解一层)
+    #[arg(long)]
+    pub no_recursive: bool,
 }
 
 #[derive(clap::Args, Debug)]
@@ -338,6 +341,8 @@ fn fixed_name(raw: &str, enc: Option<&'static encoding_rs::Encoding>) -> String 
 
 pub fn cmd_extract(args: &ExtractArgs) -> anyhow::Result<u8> {
     let enc = args.common.encoding.as_deref().map(lookup_encoding).transpose()?;
+    // 递归默认开启;--no-recursive 只解一层(-r 保留为兼容旗标)
+    let recursive = !args.no_recursive;
     let mut failures = 0;
     for path in &args.common.archives {
         let det = detect_with_warning(path, args.common.quiet)?;
@@ -354,7 +359,7 @@ pub fn cmd_extract(args: &ExtractArgs) -> anyhow::Result<u8> {
                 failures += 1;
             }
             Ok(written) => {
-                if args.recursive {
+                if recursive {
                     peel_nested(&written, args, enc, 1)?;
                 }
             }
@@ -426,7 +431,11 @@ fn extract_one(
     let mut n_overwrite_skip = 0usize;
     // 落盘的常规文件路径(供 --recursive 逐层探测嵌套归档)
     let mut written: Vec<PathBuf> = Vec::new();
-    let mut bar = crate::progress::ExtractBar::new(show_bar && !single);
+    // 总长已知(RAR/自写容器可枚举)→ pv 风格 bar+百分比+ETA;未知 → spinner
+    let mut bar = match ar.total_uncompressed() {
+        Some(t) if t > 0 => crate::progress::ExtractBar::new_sized(show_bar && !single, t),
+        _ => crate::progress::ExtractBar::new(show_bar && !single),
+    };
     // 捐赠者尚未出现的硬链接(pass 2 处理;cpio 允许 dup 排在数据条目之前)
     let mut deferred_links: Vec<(std::path::PathBuf, String)> = Vec::new();
 
@@ -1126,7 +1135,7 @@ mod tests {
         assert_eq!(std::fs::read(out.join("leaf.sh")).unwrap(), payload, "最内层叶子应直达落盘");
         assert!(!out.join("test.tar.gz").exists(), "中间归档应移除");
         assert!(!out.join("test.tar").exists(), "不应落地中间 tar");
-        // 5) 非递归对照组:只解一层,停在 test.tar.gz
+        // 5) 非递归对照组:--no-recursive 只解一层,停在 test.tar.gz
         let out1 = dir.join("o1");
         let args1 = ExtractArgs {
             common: CommonArgs {
@@ -1140,6 +1149,7 @@ mod tests {
             },
             out: out1.clone(),
             recursive: false,
+            no_recursive: true,
         };
         assert_eq!(cmd_extract(&args1).unwrap(), 0);
         assert!(out1.join("test.tar.gz").exists() && !out1.join("leaf.sh").exists());

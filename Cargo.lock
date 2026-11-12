@@ -105,6 +105,7 @@ dependencies = [
  "lz4_flex",
  "lzma-rs",
  "lzma-rust2 0.24.0",
+ "rars",
  "rpassword",
  "sevenz-rust2",
  "sha2",

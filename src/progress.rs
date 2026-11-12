@@ -13,6 +13,8 @@ use indicatif::{ProgressBar, ProgressStyle};
 
 const ENTRY_TEMPLATE: &str = "{prefix:.bold} {spinner} {pos} 个条目 {wide_msg}";
 const BYTES_TEMPLATE: &str = "{prefix:.bold} {spinner} {binary_bytes} {binary_bytes_per_sec} [{wide_msg}]";
+/// 多条目且总长已知:进度条 + 百分比 + ETA(等价 pv 全功能;条目名随 msg)。
+const PV_ENTRIES_TEMPLATE: &str = "{prefix:.bold} {wide_bar} {percent:>3}% {binary_bytes}/{binary_total_bytes} {binary_bytes_per_sec} ETA {eta} [{elapsed}] {wide_msg}";
 /// pv 风格(总长已知):进度条 + 百分比 + 已解压字节 + 速率 + ETA + 已用时。
 const PV_TEMPLATE: &str = "{prefix:.bold} {wide_bar} {percent:>3}% {binary_bytes}/{binary_total_bytes} {binary_bytes_per_sec} ETA {eta} [{elapsed}]";
 /// pv 无大小模式(总长未知):字节 + 速率 + 已用时,无进度条/ETA。
@@ -50,6 +52,18 @@ pub struct ExtractBar {
 impl ExtractBar {
     pub fn new(enabled: bool) -> Self {
         Self { pb: make_bar(enabled, "解压", BYTES_TEMPLATE) }
+    }
+    /// 总长已知模式:pv 风格 进度条/百分比/ETA(条目名走 {wide_msg})。
+    pub fn new_sized(enabled: bool, total: u64) -> Self {
+        let pb = if enabled {
+            ProgressBar::new(total)
+        } else {
+            ProgressBar::hidden()
+        };
+        pb.set_style(style(PV_ENTRIES_TEMPLATE));
+        pb.set_prefix("解压".to_string());
+        pb.enable_steady_tick(Duration::from_millis(120));
+        Self { pb }
     }
     pub fn entry(&mut self, name: &str) {
         self.pb.set_message(name.to_string());

@@ -37,6 +37,7 @@ impl<T: Read + Seek> UnifiedOps for UnifiedArchive<T> {
 pub struct UnarcBackend {
     inner: Box<dyn UnifiedOps>,
     current: Option<ArchiveEntry>,
+    max_entry_size: Option<u64>,
 }
 
 impl ArchiveBackend for UnarcBackend {
@@ -53,6 +54,7 @@ impl ArchiveBackend for UnarcBackend {
     }
     fn read_current(&mut self) -> anyhow::Result<Vec<u8>> {
         let e = self.current.take().ok_or_else(|| anyhow::anyhow!("无当前条目(先 next_entry)"))?;
+        self.check_size(e.original_size())?;
         self.inner.read(&e).map_err(|e| anyhow::anyhow!("{e}"))
     }
     fn skip_current(&mut self) -> anyhow::Result<()> {
@@ -62,6 +64,18 @@ impl ArchiveBackend for UnarcBackend {
     // unarc 的 read_to 内部仍是整读(无真流式),用 trait 默认的分块写。
     fn is_single_file(&self) -> bool {
         matches!(self.inner.format(), ArchiveFormat::Gz | ArchiveFormat::Bz2 | ArchiveFormat::Xz | ArchiveFormat::Zst | ArchiveFormat::Z)
+    }
+}
+
+impl UnarcBackend {
+    /// 读取前置检查:unarc read() 整条目进内存,超限直接明确报错而非 OOM。
+    fn check_size(&self, size: u64) -> anyhow::Result<()> {
+        if let Some(cap) = self.max_entry_size
+            && size > cap
+        {
+            anyhow::bail!("条目解压尺寸 {size} 超过上限 {cap}(--max-entry-size;该格式无流式解码)");
+        }
+        Ok(())
     }
 }
 
@@ -188,24 +202,29 @@ pub fn open(path: &Path, det: &Detected, opts: &OpenOptions) -> anyhow::Result<B
         Known::Container(_) => unreachable!("容器格式由 container 模块打开"),
     };
 
+    // RAR:走 rars 流式后端(unarc unified 的 Rar read 整档解码+全量缓存,大档必 OOM)
+    if kind == ArchiveFormat::Rar {
+        return Ok(Box::new(crate::backend::rar::RarBackend::open(path, opts)?));
+    }
+
     // 分卷:7z .001/.002… 与 zip .zip/.z01…
     if kind == ArchiveFormat::SevenZ
         && let Some(vols) = collect_7z_volumes(path) {
             let a = ArchiveFormat::open_multi_volume_7z(&vols, to_opts(opts))
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
-            return Ok(Box::new(UnarcBackend { inner: boxed(a), current: None }));
+            return Ok(Box::new(UnarcBackend { inner: boxed(a), current: None, max_entry_size: opts.max_entry_size }));
         }
     if kind == ArchiveFormat::Zip
         && let Some(vols) = collect_zip_volumes(path) {
             let a = ArchiveFormat::open_multi_volume_zip(&vols, to_opts(opts))
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
-            return Ok(Box::new(UnarcBackend { inner: boxed(a), current: None }));
+            return Ok(Box::new(UnarcBackend { inner: boxed(a), current: None, max_entry_size: opts.max_entry_size }));
         }
 
     let file = BufReader::new(File::open(path)?);
     let mut o = to_opts(opts);
-    // RAR/ARJ:挂命名模式 provider(单卷不受影响,找不到后继即正常结束)
-    if matches!(kind, ArchiveFormat::Rar | ArchiveFormat::Arj)
+    // ARJ:挂命名模式 provider(单卷不受影响,找不到后继即正常结束)
+    if kind == ArchiveFormat::Arj
         && let Some((dir, stem)) = split_dir_stem(path) {
             o = o.with_volume_provider(PatternVolumes { dir, stem, kind });
         }
@@ -214,7 +233,7 @@ pub fn open(path: &Path, det: &Detected, opts: &OpenOptions) -> anyhow::Result<B
     if let Some(n) = &opts.single_file_name {
         a.set_single_file_name(n.clone());
     }
-    Ok(Box::new(UnarcBackend { inner: boxed(a), current: None }))
+    Ok(Box::new(UnarcBackend { inner: boxed(a), current: None, max_entry_size: opts.max_entry_size }))
 }
 
 fn boxed<T: Read + Seek + 'static>(a: UnifiedArchive<T>) -> Box<dyn UnifiedOps> {
