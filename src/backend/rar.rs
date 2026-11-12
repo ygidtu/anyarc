@@ -16,7 +16,7 @@
 
 use std::cell::Cell;
 use std::fs::File;
-use std::io::{self, BufReader, Write};
+use std::io::{self, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 
 use rars::{ArchiveReadOptions, ArchiveReader, Error as RarsError, ExtractedEntryMeta};
@@ -31,6 +31,9 @@ pub struct RarBackend {
     next: usize, // 下一待返回成员游标(独立于 current,读/skip 消费不回退)
     current: Option<usize>,
     max_entry_size: Option<u64>,
+    max_total_size: Option<u64>,
+    /// 本次解压消费掉的全部卷文件路径(供 CLI 对其他参数去重)
+    volume_paths: Vec<PathBuf>,
 }
 
 #[derive(Debug, Clone)]
@@ -47,19 +50,39 @@ struct MemberInfo {
 
 impl RarBackend {
     pub fn open(path: &Path, opts: &OpenOptions) -> anyhow::Result<Self> {
-        let vols = collect_rar_volumes(path);
         let ropts = ArchiveReadOptions::with_optional_password(opts.password.as_deref().map(str::as_bytes));
-        let mut volumes = Vec::new();
-        for v in &vols {
-            let f = File::open(v).map_err(|e| anyhow::anyhow!("RAR 卷 {}: {e}", v.display()))?;
-            let a = ArchiveReader::read_reader_with_options(BufReader::new(f), ropts)
-                .map_err(|e| map_rars_error(e, v))?;
-            volumes.push(a);
+        let mut vol_paths = collect_rar_volumes(path);
+        let mut volumes: Vec<rars::Archive> = Vec::new();
+        if vol_paths.len() == 1 {
+            // 先解析首卷;若包体头声明"我是多卷之一"(RAR5 有卷号字段),
+            // 按**卷号**扫描同目录兄弟文件串联卷组 —— 不依赖文件名规范
+            let a0 = ArchiveReader::read_reader_with_options(BufReader::new(File::open(path)?), ropts)
+                .map_err(|e| map_rars_error(e, path))?;
+            if declares_volume(&a0) {
+                // 卷组串联:gather 内部按"主头卷号→文件名 partN"两级回退
+                vol_paths = gather_sibling_volumes(path, &a0, &ropts);
+            }
+            volumes.push(a0);
+            for v in &vol_paths[1..] {
+                let a = ArchiveReader::read_reader_with_options(BufReader::new(File::open(v)?), ropts)
+                    .map_err(|e| map_rars_error(e, v))?;
+                volumes.push(a);
+            }
+        } else {
+            for v in &vol_paths {
+                let a = ArchiveReader::read_reader_with_options(BufReader::new(File::open(v)?), ropts)
+                    .map_err(|e| map_rars_error(e, v))?;
+                volumes.push(a);
+            }
         }
         let members = scan_members(&volumes);
         if members.is_empty() {
             anyhow::bail!("RAR: 未解析到任何条目({})", path.display());
         }
+        let volume_paths = vol_paths
+            .iter()
+            .map(|p| p.canonicalize().unwrap_or_else(|_| p.clone()))
+            .collect();
         Ok(Self {
             volumes,
             members,
@@ -67,14 +90,21 @@ impl RarBackend {
             next: 0,
             current: None,
             max_entry_size: opts.max_entry_size,
+            max_total_size: opts.max_total_size,
+            volume_paths,
         })
     }
 
-    fn check_size(&self, size: u64) -> anyhow::Result<()> {
-        if let Some(cap) = self.max_entry_size
-            && size > cap
-        {
-            anyhow::bail!("条目解压尺寸 {size} 超过上限 {cap}(--max-entry-size)");
+    /// 限额语义:整读进内存(read_current)受 --max-entry-size 约束(防 OOM);
+    /// 流式直写(read_current_to,内存 O(窗口))受 --max-total-size 约束(磁盘防护)。
+    fn check_size(&self, size: u64, streaming: bool) -> anyhow::Result<()> {
+        let (cap, flag) = if streaming {
+            (self.max_total_size.unwrap_or(u64::MAX), "--max-total-size")
+        } else {
+            (self.max_entry_size.unwrap_or(u64::MAX), "--max-entry-size")
+        };
+        if size > cap {
+            anyhow::bail!("单个文件太大:解压后 {size} 字节超过上限 {cap}(可用 {flag} 调整,0=不限)");
         }
         Ok(())
     }
@@ -87,6 +117,129 @@ fn map_rars_error(e: RarsError, path: &Path) -> anyhow::Error {
         }
         _ => anyhow::anyhow!("RAR {}: {e}", path.display()),
     }
+}
+
+/// 包体头是否声明"属于多卷集"(RAR4 也真,但无卷号字段,只能靠命名规范)
+fn declares_volume(a: &rars::Archive) -> bool {
+    match a {
+        rars::Archive::Rar50Plus(x) => x.main.is_volume(),
+        rars::Archive::Rar15To40(x) => x.main.is_volume(),
+        rars::Archive::Rar13(x) => x.main.is_volume(),
+        _ => false,
+    }
+}
+
+/// 卷号仅 RAR5 头字段可得(RAR4 卷序只存在于文件名约定,走 collect_rar_volumes)
+fn volume_number(a: &rars::Archive) -> Option<u64> {
+    match a {
+        rars::Archive::Rar50Plus(x) if x.main.is_volume() => x.main.volume_number,
+        _ => None,
+    }
+}
+
+fn rar_debug_enabled() -> bool {
+    std::env::var_os("ANYARC_DEBUG").is_some()
+}
+
+/// 文件是否以 RAR 魔数开头(读前 7 字节;Rar!\x1a\x07 + 01/02 版本字节)
+fn is_rar_magic_file(path: &Path) -> bool {
+    let Ok(mut f) = File::open(path) else {
+        return false;
+    };
+    let mut magic = [0u8; 7];
+    matches!(f.read_exact(&mut magic), Ok(()) if &magic[..6] == b"Rar!\x1a\x07" && matches!(magic[6], 0x01 | 0x02))
+}
+
+/// 从文件名提取 `partN` 序号(如 xx.part1.任意后缀 → 1)。
+/// WinRAR 少卷档主头不写卷号字段,文件名序号是可靠回退;扩展名被改坏也有效。
+fn part_number_in_name(path: &Path) -> Option<u64> {
+    let name = path.file_name()?.to_string_lossy().to_lowercase();
+    let pos = name.find("part")?;
+    let digits: String = name[pos + 4..].chars().take_while(|c| c.is_ascii_digit()).collect();
+    (!digits.is_empty()).then(|| digits.parse().ok())?
+}
+
+/// 卷集 stem:文件名 "partN" 之前的前缀(小写),用于排除同目录其他卷组
+fn volume_stem(path: &Path) -> Option<String> {
+    let name = path.file_name()?.to_string_lossy().to_lowercase();
+    let pos = name.find("part")?;
+    Some(name[..pos].to_string())
+}
+
+/// 按卷号串联:收集目录内所有"声明为卷"的 RAR 文件;
+/// 全体有主头卷号 → 按卷号;否则按文件名 partN;再不行放弃(保持原报错)。
+fn gather_sibling_volumes(path: &Path, first: &rars::Archive, ropts: &ArchiveReadOptions<'_>) -> Vec<PathBuf> {
+    struct Vol {
+        p: PathBuf,
+        no: Option<u64>,
+        part: Option<u64>,
+    }
+    let mut vols = vec![Vol { p: path.to_path_buf(), no: volume_number(first), part: part_number_in_name(path) }];
+    let stem = volume_stem(path);
+    if let Some(dir) = path.parent()
+        && let Ok(rd) = std::fs::read_dir(dir)
+    {
+        for e in rd.flatten() {
+            let p = e.path();
+            if p == *path || !is_rar_magic_file(&p) {
+                continue;
+            }
+            // 只接受同卷组(stem 前缀一致)的兄弟,避免误连同目录其他多卷包
+            let same_group = match (&stem, volume_stem(&p)) {
+                (Some(s), Some(ps)) => ps.as_str() == s.as_str(),
+                (None, _) => true, // 本卷无 part 序号时不做前缀限制
+                (Some(_), None) => false,
+            };
+            if !same_group {
+                continue;
+            }
+            let Ok(f) = File::open(&p) else { continue };
+            match ArchiveReader::read_reader_with_options(BufReader::new(f), *ropts) {
+                Ok(a) => {
+                    if declares_volume(&a) {
+                        if rar_debug_enabled() {
+                            eprintln!("[rar-debug] 兄弟卷 {} 主头卷号={:?} 文件名序号={:?}", p.display(), volume_number(&a), part_number_in_name(&p));
+                        }
+                        vols.push(Vol { p: p.clone(), no: volume_number(&a), part: part_number_in_name(&p) });
+                    }
+                }
+                Err(err) => {
+                    if rar_debug_enabled() {
+                        eprintln!("[rar-debug] 解析失败 {}: {err}", p.display());
+                    }
+                }
+            }
+        }
+    }
+    // 统一编号源:主头卷号齐全优先,否则文件名 partN 齐全
+    let use_no = vols.iter().all(|v| v.no.is_some());
+    let use_part = !use_no && vols.iter().all(|v| v.part.is_some());
+    let key = |v: &Vol| if use_no { v.no } else if use_part { v.part } else { None };
+    let pairs: Vec<(u64, PathBuf)> = vols.iter().filter_map(|v| key(v).map(|k| (k, v.p.clone()))).collect();
+    if pairs.len() < 2 {
+        return vec![path.to_path_buf()];
+    }
+    let by_no: std::collections::BTreeMap<u64, PathBuf> = pairs.into_iter().collect();
+    let my_key = key(&vols[0]);
+    if rar_debug_enabled() {
+        eprintln!("[rar-debug] 卷图 {by_no:?} 本卷key={my_key:?}");
+    }
+    volume_chain(&by_no, my_key.unwrap_or(0))
+}
+
+/// 从卷号 map 中取包含 cur_no 的连续段,升序路径列表。
+fn volume_chain(by_no: &std::collections::BTreeMap<u64, PathBuf>, cur_no: u64) -> Vec<PathBuf> {
+    let mut lo = cur_no;
+    while lo > 0 && by_no.contains_key(&(lo - 1)) {
+        lo -= 1;
+    }
+    let mut out = Vec::new();
+    let mut i = lo;
+    while let Some(p) = by_no.get(&i) {
+        out.push(p.clone());
+        i += 1;
+    }
+    out
 }
 
 fn scan_members(volumes: &[rars::Archive]) -> Vec<MemberInfo> {
@@ -251,6 +404,9 @@ impl ArchiveBackend for RarBackend {
     }
 
     fn read_current(&mut self) -> anyhow::Result<Vec<u8>> {
+        if let Some(i) = self.current {
+            self.check_size(self.members[i].size, false)?; // 整读进内存:entry 限额
+        }
         let mut buf = Vec::new();
         self.read_current_to(&mut buf)?;
         Ok(buf)
@@ -264,7 +420,7 @@ impl ArchiveBackend for RarBackend {
         if info.kind != EntryKind::File {
             return Ok(0);
         }
-        self.check_size(info.size)?;
+        self.check_size(info.size, true)?;
         let pwd = self.password.as_deref().map(str::as_bytes);
         let target = info.raw_name.clone();
         let seen = Cell::new(false);
@@ -344,6 +500,10 @@ impl ArchiveBackend for RarBackend {
 
     fn total_uncompressed(&self) -> Option<u64> {
         Some(self.members.iter().map(|m| m.size).sum())
+    }
+
+    fn consumed_paths(&self) -> Vec<PathBuf> {
+        self.volume_paths.clone()
     }
 }
 
@@ -441,5 +601,85 @@ mod tests {
         std::fs::write(dir.join("solo.rar"), b"x").unwrap();
         assert_eq!(collect_rar_volumes(&dir.join("solo.rar")).len(), 1);
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn rar_caps_entry_vs_streaming() {
+        // 语义:--max-entry-size 只挡整读进内存(read_current);
+        // 流式直写(read_current_to)受 --max-total-size 约束 —— 4.84GB
+        // 大条目在 7GB 机器上流式解不再被 4GiB entry cap 误杀。
+        let dir = std::env::temp_dir().join(format!("anyarc_rarcap_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("c.rar");
+        build_rar(&p, false); // tool.sh 18B / data.bin 1000B
+
+        // entry cap=10:整读报错,流式放行
+        let opts = OpenOptions { max_entry_size: Some(10), ..Default::default() };
+        let mut be = RarBackend::open(&p, &opts).unwrap();
+        be.next_entry().unwrap().unwrap(); // bin(dir)
+        be.skip_current().unwrap();
+        be.next_entry().unwrap().unwrap(); // tool.sh
+        assert!(be.read_current().is_err(), "整读应受 entry cap 约束");
+        let mut buf = Vec::new();
+        assert!(be.read_current_to(&mut buf).is_ok(), "流式不受 entry cap 约束");
+        drop(be);
+
+        // total cap=5:流式也拦(磁盘防护)
+        let opts2 = OpenOptions { max_total_size: Some(5), ..Default::default() };
+        let mut be2 = RarBackend::open(&p, &opts2).unwrap();
+        be2.next_entry().unwrap().unwrap();
+        be2.skip_current().unwrap();
+        be2.next_entry().unwrap().unwrap();
+        let mut buf2 = Vec::new();
+        assert!(be2.read_current_to(&mut buf2).is_err(), "流式受 total cap 约束");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+}
+
+#[cfg(test)]
+mod chain_tests {
+    use super::volume_chain;
+    use std::collections::BTreeMap;
+    use std::path::PathBuf;
+
+    #[test]
+    fn contiguous_chain_only() {
+        let m: BTreeMap<u64, PathBuf> = [
+            (0, PathBuf::from("v0")),
+            (1, PathBuf::from("v1")),
+            (2, PathBuf::from("v2")),
+            (7, PathBuf::from("lonely7")),
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(volume_chain(&m, 1), vec![PathBuf::from("v0"), PathBuf::from("v1"), PathBuf::from("v2")]);
+        assert_eq!(volume_chain(&m, 7), vec![PathBuf::from("lonely7")]);
+        // 中间断链:从 1 起只能取 1,2
+        let m2: BTreeMap<u64, PathBuf> = [(1, "v1"), (2, "v2"), (4, "v4")]
+            .into_iter()
+            .map(|(n, p)| (n, PathBuf::from(p)))
+            .collect();
+        assert_eq!(volume_chain(&m2, 1), vec![PathBuf::from("v1"), PathBuf::from("v2")]);
+        // 卷 1 传入但卷 0 存在 → 从头串起(允许从任意卷切入)
+        assert_eq!(volume_chain(&m, 0).len(), 3);
+    }
+}
+
+#[cfg(test)]
+mod name_tests {
+    use super::{part_number_in_name, volume_stem};
+    use std::path::Path;
+
+    #[test]
+    fn part_number_survives_broken_extension() {
+        // 用户把扩展名改坏(r删除ar),partN 序号仍可从文件名取得
+        let p = Path::new("foxb31-32.part2.r删除ar");
+        assert_eq!(part_number_in_name(p), Some(2));
+        assert_eq!(volume_stem(p).as_deref(), Some("foxb31-32."));
+        assert_eq!(part_number_in_name(Path::new("SF2.PART10.RAR")), Some(10));
+        assert_eq!(part_number_in_name(Path::new("plain.rar")), None);
+        assert_eq!(volume_stem(Path::new("plain.rar")), None);
     }
 }

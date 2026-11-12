@@ -73,7 +73,7 @@ impl UnarcBackend {
         if let Some(cap) = self.max_entry_size
             && size > cap
         {
-            anyhow::bail!("条目解压尺寸 {size} 超过上限 {cap}(--max-entry-size;该格式无流式解码)");
+            anyhow::bail!("单个文件太大:解压后 {size} 字节超过上限 {cap}(该格式需要整体读入内存;可用 --max-entry-size 调整,0=不限)");
         }
         Ok(())
     }

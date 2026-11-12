@@ -28,8 +28,12 @@
   unix 权限从头解析(RAR5 host_os=1 / legacy=3)。
   限制:solid 多成员逐条提取为 O(n²) 重扫描(单条目场景无影响);
   RAR5 symlink/hardlink(redirection)按特殊条目跳过
-- M5+ `extract` 递归默认开启(zip→tar.gz→tar→leaf 一次直达最内层,
-  中间归档移除),`--no-recursive` 关闭;`-r` 保留为兼容旗标
+- M5+ `extract --recursive/-r`(显式开启):解出的文件若仍是压缩包则继续向内解压、
+  移除中间压缩包,一次直达最内层叶子;新增 `--smart` 智能扁平——解压内容被同名
+  顶层目录重复包裹(763/763/)时自动合并一层
+- M5++ RAR 分卷智能识别(不依赖文件名):首卷主头无卷号字段(WinRAR 行为)时,
+  回退按文件名 partN 序号串联卷组(扩展名改坏也能解),并要求同 stem 前缀防误连;
+  同一卷集的多个文件作参数自动去重;解压失败清理半成品输出
 - M4 发布工程:
   - `anyarc completions <bash|zsh|fish|elvish|powershell>` 生成 shell 补全脚本
   - `anyarc man` 输出 roff man page(`anyarc man | man -l -`)
@@ -39,6 +43,11 @@
 - `poc/e2e.sh`:133 fixture CLI 端到端冒烟固化脚本
 
 ### 修复
+- 流式解压的大文件不再被 `--max-entry-size`(默认 4 GiB)误杀:该限额只约束
+  "整体读入内存"的老路径(防 OOM);流式直写改由 `--max-total-size`(默认
+  32 GiB)兜底,并在 extract 增加跨条目累计总量预算
+- CLI 用户可见文案全面通俗化(去掉"落盘/条目/边信道"等黑话,报错信息
+  附带调整指引)
 - RAR 分卷名收集:RAR5 新式 `stem.partNNN.rar` 漏了 `part` 段(此前只会
   收到首卷,跨卷成员直接报错)
 - 解压落盘不还原归档权限位(`.sh`/可执行脚本解出变 644):`Entry` 新增

@@ -86,12 +86,12 @@ pub struct ExtractArgs {
     /// 输出目录(默认当前目录)
     #[arg(short = 'o', long, default_value = ".")]
     pub out: PathBuf,
-    /// 递归解压(默认开启;此旗标为兼容保留,显式传入无额外效果)
+    /// 递归解压:解出的文件若仍是可识别归档,继续向内解一层(中间归档移除)
     #[arg(short = 'r', long)]
     pub recursive: bool,
-    /// 关闭递归解压(只解一层)
+    /// 智能扁平:解压内容若被同名顶层目录包裹(763/763/)则合并一层;配合 --recursive
     #[arg(long)]
-    pub no_recursive: bool,
+    pub smart: bool,
 }
 
 #[derive(clap::Args, Debug)]
@@ -341,13 +341,23 @@ fn fixed_name(raw: &str, enc: Option<&'static encoding_rs::Encoding>) -> String 
 
 pub fn cmd_extract(args: &ExtractArgs) -> anyhow::Result<u8> {
     let enc = args.common.encoding.as_deref().map(lookup_encoding).transpose()?;
-    // 递归默认开启;--no-recursive 只解一层(-r 保留为兼容旗标)
-    let recursive = !args.no_recursive;
+    let recursive = args.recursive;
     let mut failures = 0;
+    let mut consumed: std::collections::HashSet<PathBuf> = Default::default();
     for path in &args.common.archives {
+        let canon = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+        if consumed.contains(&canon) {
+            if !args.common.quiet {
+                eprintln!("跳过 {}:它是前面那个压缩包的分卷之一,已一并处理", path.display());
+            }
+            continue;
+        }
         let det = detect_with_warning(path, args.common.quiet)?;
         let mut ar = open_verified(path, &det, &args.common)?;
-        // 后端不提供 mode 时走 header 边信道(zip 中央目录/tar 家族流扫描)补齐
+        for cp in ar.consumed_paths() {
+            consumed.insert(cp);
+        }
+        // 归档头里没有权限信息时(zip/tar 家族),额外读一遍文件头补上
         let modes = if ar.provides_mode() {
             Default::default()
         } else {
@@ -359,6 +369,11 @@ pub fn cmd_extract(args: &ExtractArgs) -> anyhow::Result<u8> {
                 failures += 1;
             }
             Ok(written) => {
+                let written = if args.smart {
+                    crate::extract::flatten_dup_wrappers(&args.out, written)
+                } else {
+                    written
+                };
                 if recursive {
                     peel_nested(&written, args, enc, 1)?;
                 }
@@ -371,18 +386,18 @@ pub fn cmd_extract(args: &ExtractArgs) -> anyhow::Result<u8> {
 /// 递归解压上限(层):防自嵌循环/异常深链(zip 内再放同名 zip 等)。
 const MAX_RECURSE_DEPTH: usize = 16;
 
-/// 对刚解出的文件逐个探测:仍是可识别归档 → 就地解压到其所在目录,
-/// 成功后移除该中间归档并继续向内;叶子文件(不可识别)原样保留。
+/// 对刚解出的文件逐个识别:仍是压缩包 → 就地继续向内解压,成功后移除
+/// 该中间压缩包;普通文件(识别不出压缩包格式)原样保留。
 /// 自嵌循环由两层机制兜底:深度上限告警 + 同名条目覆盖策略跳过(inner 为空即停)。
 fn peel_nested(files: &[PathBuf], args: &ExtractArgs, enc: Option<&'static encoding_rs::Encoding>, depth: usize) -> anyhow::Result<()> {
     if depth > MAX_RECURSE_DEPTH {
-        eprintln!("警告: 递归解压已达 {MAX_RECURSE_DEPTH} 层上限(疑似自嵌归档),停止向内");
+        eprintln!("警告: 已经深入解压 {MAX_RECURSE_DEPTH} 层,停止(疑似压缩包自我嵌套)");
         return Ok(());
     }
     for f in files {
         let det = match detect::detect(f) {
             Ok(Some(d)) => d,
-            // 不可识别 → 叶子;探测 IO 错误也按叶子保留
+            // 识别不出压缩包格式 → 普通文件;探测 IO 错误同样按普通文件保留
             _ => continue,
         };
         let dest = f.parent().unwrap_or(Path::new(".")).to_path_buf();
@@ -396,17 +411,22 @@ fn peel_nested(files: &[PathBuf], args: &ExtractArgs, enc: Option<&'static encod
         });
         match extracted {
             Ok(inner) if !inner.is_empty() => {
-                // 解出真实内容才移除中间归档;空产物(被覆盖策略跳过等)保留原文件
-                std::fs::remove_file(f).map_err(|e| anyhow::anyhow!("移除中间归档 {}: {e}", f.display()))?;
+                // 解出真实内容才移除中间压缩包;空产物(被覆盖策略跳过等)保留原文件
+                let inner = if args.smart {
+                    crate::extract::flatten_dup_wrappers(&dest, inner)
+                } else {
+                    inner
+                };
+                std::fs::remove_file(f).map_err(|e| anyhow::anyhow!("删除中间压缩包 {}: {e}", f.display()))?;
                 if !args.common.quiet {
-                    eprintln!("递归: {} → {} 个条目落盘(中间归档已移除,第 {} 层)", f.display(), inner.len(), depth);
+                    eprintln!("继续解压 {}:得到 {} 个文件(已删除中间压缩包,第 {depth} 层)", f.display(), inner.len());
                 }
                 peel_nested(&inner, args, enc, depth + 1)?;
             }
             Ok(_) => {}
             Err(e) => {
-                // 内层解压失败:保留该文件为普通叶子,不阻断其余条目
-                eprintln!("警告: 嵌套解压跳过 {}: {e:#}", f.display());
+                // 内层解压失败:保留该文件为普通文件,不影响其余条目
+                eprintln!("警告: 跳过继续解压 {}: {e:#}", f.display());
             }
         }
     }
@@ -425,6 +445,9 @@ fn extract_one(
     std::fs::create_dir_all(dest)?;
     let single = ar.is_single_file();
     let show_bar = crate::extract::is_tty() && !args.common.quiet;
+    // 跨条目累计写盘预算(所有后端统一;流式后端的磁盘防护;0=不限)
+    let total_cap = args.common.max_total_size.filter(|v| *v > 0).unwrap_or(u64::MAX);
+    let mut total_written: u64 = 0;
     let mut n_file = 0usize;
     let mut n_dir = 0usize;
     let mut n_skipped = 0usize;
@@ -467,7 +490,7 @@ fn extract_one(
                     p.exists() && p.canonicalize().is_ok_and(|a| path.canonicalize().is_ok_and(|b| a == b))
                 };
                 if self_ref {
-                    eprintln!("警告: 跳过自引用条目 {name}(解出路径与归档文件相同)");
+                    eprintln!("警告: 跳过 {name}(它和压缩包本身同名,继续解压会覆盖数据源)");
                     n_skipped += 1;
                     ar.skip_current()?;
                     continue;
@@ -483,19 +506,31 @@ fn extract_one(
                 }
                 crate::extract::ensure_writable(&p); // 上次还原的只读 mode 不挡住重写
                 let mut f = std::fs::File::create(&p)?;
-                if single {
-                    // pv 风格:总长已知 → 进度条+百分比+ETA;未知 → 字节+速率+用时。
-                    let pv = crate::progress::BytesBar::new(show_bar, "解压", (entry.size > 0).then_some(entry.size));
-                    let mut w = pv.wrap(&mut f);
-                    ar.read_current_to(&mut w)?; // 读后条目已消费
-                    drop(w);
-                    pv.finish();
-                } else {
-                    let mut w = bar.wrap(&mut f);
-                    ar.read_current_to(&mut w)?;
-                    drop(w);
-                }
+                let res = (|| -> anyhow::Result<u64> {
+                    if single {
+                        // pv 风格:总长已知 → 进度条+百分比+ETA;未知 → 字节+速率+用时。
+                        let pv = crate::progress::BytesBar::new(show_bar, "解压", (entry.size > 0).then_some(entry.size));
+                        let mut w = pv.wrap(&mut f);
+                        let n = ar.read_current_to(&mut w)?; // 读后条目已消费
+                        drop(w);
+                        pv.finish();
+                        Ok(n)
+                    } else {
+                        let mut w = bar.wrap(&mut f);
+                        let n = ar.read_current_to(&mut w)?;
+                        drop(w);
+                        Ok(n)
+                    }
+                })();
                 drop(f);
+                if res.is_err() {
+                    let _ = std::fs::remove_file(&p); // 解压失败不留半成品
+                }
+                let n = res?;
+                total_written += n;
+                if total_written > total_cap {
+                    anyhow::bail!("解压文件总大小超限:{total_written} > {total_cap} 字节(可用 --max-total-size 调整,0=不限)");
+                }
                 let m = entry.mode.or_else(|| modes.get(&crate::extract::norm_entry_name(&name)).copied());
                 crate::extract::set_mode(&p, m);
                 n_file += 1;
@@ -576,9 +611,13 @@ fn extract_one(
                     crate::extract::ensure_writable(&p);
                     let mut f = std::fs::File::create(&p)?;
                     let mut w = bar.wrap(&mut f);
-                    ar.read_current_to(&mut w)?;
+                    let n = ar.read_current_to(&mut w)?;
                     drop(w);
                     drop(f);
+                    total_written += n;
+                    if total_written > total_cap {
+                        anyhow::bail!("解压文件总大小超限:{total_written} > {total_cap} 字节(可用 --max-total-size 调整,0=不限)");
+                    }
                     let m = entry.mode.or_else(|| modes.get(&crate::extract::norm_entry_name(&name)).copied());
                     crate::extract::set_mode(&p, m);
                     n_file += 1;
@@ -619,7 +658,7 @@ fn extract_one(
         eprintln!("解压完成: {} 个文件, {} 个目录({})", n_file, n_dir, path.display());
     }
     if n_skipped > 0 {
-        eprintln!("警告: {} 个不安全/特殊条目已跳过(Zip-slip 防护)", n_skipped);
+        eprintln!("警告: 已跳过 {} 个危险路径或特殊文件(安全保护)", n_skipped);
     }
     if n_overwrite_skip > 0 && !args.common.quiet {
         eprintln!("提示: {} 个已存在文件未覆盖(用 --overwrite 强制)", n_overwrite_skip);
@@ -1130,7 +1169,7 @@ mod tests {
             },
             out: out.clone(),
             recursive: true,
-            no_recursive: false,
+            smart: false,
         };
         assert_eq!(cmd_extract(&args).unwrap(), 0);
         assert_eq!(std::fs::read(out.join("leaf.sh")).unwrap(), payload, "最内层叶子应直达落盘");
@@ -1150,10 +1189,102 @@ mod tests {
             },
             out: out1.clone(),
             recursive: false,
-            no_recursive: true,
+            smart: false,
         };
         assert_eq!(cmd_extract(&args1).unwrap(), 0);
         assert!(out1.join("test.tar.gz").exists() && !out1.join("leaf.sh").exists());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// --recursive --smart:同名目录重复包裹(763/763/)自动合并成一层。
+    #[test]
+    fn recursive_smart_collapses_dup_dir() {
+        use std::io::Write as _;
+        let payload = b"final-content";
+        // tar 顶层是 763/leaf.txt
+        let mut tar_bytes = Vec::new();
+        {
+            let mut tb = tar::Builder::new(&mut tar_bytes);
+            let mut h = tar::Header::new_gnu();
+            h.set_size(payload.len() as u64);
+            h.set_mode(0o644);
+            h.set_cksum();
+            tb.append_data(&mut h, "763/leaf.txt", &payload[..]).unwrap();
+            tb.finish().unwrap();
+        }
+        let mut gzb = Vec::new();
+        {
+            let mut e = flate2::write::GzEncoder::new(&mut gzb, flate2::Compression::default());
+            e.write_all(&tar_bytes).unwrap();
+            e.finish().unwrap();
+        }
+        // zip 里放 763/763.tar.gz(模拟网盘常见打包)
+        let dir = std::env::temp_dir().join(format!("anyarc_smart_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let outer = dir.join("763.zip");
+        {
+            let mut zw = zip::ZipWriter::new(std::fs::File::create(&outer).unwrap());
+            let opts: zip::write::FileOptions<'_, '_, ()> =
+                zip::write::FileOptions::default().compression_method(zip::CompressionMethod::Stored);
+            zw.add_directory("763/", opts).unwrap();
+            zw.start_file("763/763.tar.gz", opts).unwrap();
+            zw.write_all(&gzb).unwrap();
+            zw.finish().unwrap();
+        }
+        let out = dir.join("o");
+        let args = ExtractArgs {
+            common: CommonArgs {
+                archives: vec![outer],
+                password: None,
+                overwrite: false,
+                encoding: None,
+                max_entry_size: None,
+                max_total_size: None,
+                quiet: true,
+            },
+            out: out.clone(),
+            recursive: true,
+            smart: true,
+        };
+        assert_eq!(cmd_extract(&args).unwrap(), 0);
+        // 期望:o/763/leaf.txt(只有一层 763)
+        assert!(out.join("763/leaf.txt").exists(), "最终 763/ 应在输出目录下");
+        assert!(!out.join("763/763").exists(), "重复包裹的 763/763/ 应被合并");
+        assert_eq!(std::fs::read(out.join("763/leaf.txt")).unwrap(), payload);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// 分卷去重:同一卷集里多个文件同时作为参数,只解压一次。
+    #[test]
+    fn duplicate_volume_args_extract_once() {
+        use rars::{builder::Builder, ArchiveVersion};
+        let dir = std::env::temp_dir().join(format!("anyarc_voldedup_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("single.rar");
+        {
+            let mut b = Builder::new(ArchiveVersion::Rar50);
+            b.add_bytes(b"one.txt".to_vec(), b"1".to_vec(), None, Some(0o644)).unwrap();
+            b.write_to_path(&p, None).unwrap();
+        }
+        let out = dir.join("o");
+        let args = ExtractArgs {
+            common: CommonArgs {
+                archives: vec![p.clone(), p.clone()],
+                password: None,
+                overwrite: false,
+                encoding: None,
+                max_entry_size: None,
+                max_total_size: None,
+                quiet: true,
+            },
+            out: out.clone(),
+            recursive: false,
+            smart: false,
+        };
+        assert_eq!(cmd_extract(&args).unwrap(), 0);
+        assert_eq!(std::fs::read(out.join("one.txt")).unwrap(), b"1");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

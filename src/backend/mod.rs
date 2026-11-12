@@ -9,7 +9,7 @@
 pub mod rar;
 pub mod unarc;
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use unarc_rs::unified::ArchiveFormat;
 
@@ -140,6 +140,11 @@ pub trait ArchiveBackend {
     /// extract 进度条据此显示 进度条/百分比/ETA;None = 未知(spinner 模式)。
     fn total_uncompressed(&self) -> Option<u64> {
         None
+    }
+    /// 打开本归档实际消费的文件路径(分卷后端返回全部卷):
+    /// CLI 对重复参数去重,避免同一卷集被解压多次。
+    fn consumed_paths(&self) -> Vec<PathBuf> {
+        Vec::new()
     }
     /// 流式把当前条目解压数据写入 w,返回写入字节数。
     /// 可流式的后端应覆盖(边解压边推进度);默认整读后分块写。

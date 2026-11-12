@@ -45,18 +45,25 @@ pub struct ContainerBackend {
     next: usize,
     current: Option<usize>,
     max_entry_size: Option<u64>,
+    max_total_size: Option<u64>,
 }
 
 impl ContainerBackend {
-    fn new(fmt: Format, path: &Path, plan: Vec<(Entry, Fetch)>, max_entry_size: Option<u64>) -> Self {
-        Self { fmt, path: path.to_path_buf(), plan, next: 0, current: None, max_entry_size }
+    fn new(
+        fmt: Format,
+        path: &Path,
+        plan: Vec<(Entry, Fetch)>,
+        max_entry_size: Option<u64>,
+        max_total_size: Option<u64>,
+    ) -> Self {
+        Self { fmt, path: path.to_path_buf(), plan, next: 0, current: None, max_entry_size, max_total_size }
     }
     /// 条目大小硬上限:先对文件尺寸,再对解压限额。
     fn check_size(&self, len: u64) -> anyhow::Result<()> {
         if let Some(m) = self.max_entry_size
             && len > m
         {
-            anyhow::bail!("条目解压尺寸 {len} 超过上限 {m}(--max-entry-size)");
+            anyhow::bail!("单个文件太大:解压后 {len} 字节超过上限 {m}(可用 --max-entry-size 调整,0=不限)");
         }
         Ok(())
     }
@@ -124,14 +131,22 @@ impl ArchiveBackend for ContainerBackend {
     fn read_current_to(&mut self, w: &mut dyn Write) -> anyhow::Result<u64> {
         let i = self.current.take().ok_or_else(|| anyhow::anyhow!("无当前条目"))?;
         let flen = std::fs::metadata(&self.path)?.len();
-        let cap = self.max_entry_size.unwrap_or(u64::MAX);
+        // 流式直写限额用 --max-total-size(内存 O(窗口),entry 限额只挡整读路径)
+        let cap = self.max_total_size.unwrap_or(u64::MAX);
         match &self.plan[i].1 {
-            Fetch::Inline(b) => write_chunks(b, w),
+            Fetch::Inline(b) => {
+                if b.len() as u64 > cap {
+                    anyhow::bail!("单个文件太大:{} 字节超过上限 {cap}(可用 --max-total-size 调整,0=不限)", b.len());
+                }
+                write_chunks(b, w)
+            }
             Fetch::Raw { off, len } => {
                 if *off > flen || *len > flen - *off {
                     anyhow::bail!("条目数据超出文件范围");
                 }
-                self.check_size(*len)?;
+                if *len > cap {
+                    anyhow::bail!("单个文件太大:{len} 字节超过上限 {cap}(可用 --max-total-size 调整,0=不限)");
+                }
                 let mut f = File::open(&self.path)?;
                 f.seek(SeekFrom::Start(*off))?;
                 copy_chunks(f.take(*len), w)
@@ -164,7 +179,7 @@ impl ArchiveBackend for ContainerBackend {
                         let mut sink = CappedWrite { w, written: 0, cap, overflow: false };
                         if let Err(e) = lzma_rs::lzma_decompress(&mut r, &mut sink) {
                             if sink.overflow {
-                                anyhow::bail!("解压尺寸超过上限 {cap}(--max-entry-size)");
+                                anyhow::bail!("单个文件太大:解压后超过上限 {cap}(可用 --max-entry-size 调整,0=不限)");
                             }
                             anyhow::bail!("lzma: {e}");
                         }
@@ -172,7 +187,7 @@ impl ArchiveBackend for ContainerBackend {
                     }
                 };
                 if n > cap {
-                    anyhow::bail!("解压尺寸超过上限 {cap}(--max-entry-size)");
+                    anyhow::bail!("单个文件太大:解压后超过上限 {cap}(可用 --max-entry-size 调整,0=不限)");
                 }
                 Ok(n)
             }
@@ -253,7 +268,7 @@ pub(crate) fn decompress(comp: Comp, raw: &[u8], cap: u64) -> anyhow::Result<Vec
             let mut cw = Capped { out: &mut out, cap, overflow: false };
             if let Err(e) = lzma_rs::lzma_decompress(&mut r, &mut cw) {
                 if cw.overflow {
-                    anyhow::bail!("解压尺寸超过上限 {cap}(--max-entry-size)");
+                    anyhow::bail!("单个文件太大:解压后超过上限 {cap}(可用 --max-entry-size 调整,0=不限)");
                 }
                 anyhow::bail!("lzma: {e}");
             }
@@ -271,7 +286,7 @@ pub(crate) fn decompress(comp: Comp, raw: &[u8], cap: u64) -> anyhow::Result<Vec
         }
     }
     if out.len() as u64 > cap {
-        anyhow::bail!("解压尺寸超过上限 {cap}(--max-entry-size)");
+        anyhow::bail!("单个文件太大:解压后超过上限 {cap}(可用 --max-entry-size 调整,0=不限)");
     }
     Ok(out)
 }
@@ -425,7 +440,7 @@ pub fn open(path: &Path, det: &Detected, opts: &OpenOptions) -> anyhow::Result<B
         Container::Ape => Format::Ape,
         Container::Shn => Format::Shn,
     };
-    Ok(Box::new(ContainerBackend::new(fmt, path, plan, opts.max_entry_size)))
+    Ok(Box::new(ContainerBackend::new(fmt, path, plan, opts.max_entry_size, opts.max_total_size)))
 }
 
 // ------------------------------------------------------------------ ar
@@ -1202,7 +1217,7 @@ fn decode_audio(container: Container, data: &[u8], cap: u64) -> anyhow::Result<(
         _ => unreachable!("decode_audio 只处理音频容器"),
     };
     if wav.len() as u64 > cap {
-        anyhow::bail!("解压尺寸超过上限 {cap}(--max-entry-size)");
+        anyhow::bail!("单个文件太大:解压后超过上限 {cap}(可用 --max-entry-size 调整,0=不限)");
     }
     Ok((label.to_string(), wav))
 }

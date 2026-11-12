@@ -72,6 +72,54 @@ pub fn is_tty() -> bool {
     std::io::stdout().is_terminal()
 }
 
+/// --smart:本层解压内容若整体位于一个与上级目录**同名**的文件夹内
+/// (典型:763.tar.gz 解出 763/,而它已在 763/ 下 → 763/763/),把内容
+/// 上移一层、删掉重复包裹。冲突或异常时保持原样。返回更新后的路径列表。
+pub fn flatten_dup_wrappers(dest: &Path, written: Vec<PathBuf>) -> Vec<PathBuf> {
+    if written.is_empty() {
+        return written;
+    }
+    let Some(dest_name) = dest.file_name().map(|s| s.to_string_lossy().into_owned()) else {
+        return written; // 目标是 . 之类无名字录,不存在同名包裹
+    };
+    let Some(top) = written
+        .iter()
+        .find_map(|e| e.strip_prefix(dest).ok())
+        .and_then(|rel| rel.components().next())
+        .map(|c| c.as_os_str().to_string_lossy().into_owned())
+    else {
+        return written;
+    };
+    if top != dest_name {
+        return written;
+    }
+    let t_dir = dest.join(&top);
+    if !t_dir.is_dir() || !written.iter().all(|e| e.starts_with(&t_dir)) {
+        return written;
+    }
+    // 全部上移;任何命名冲突则整体放弃(不半途移动)
+    let Ok(entries) = std::fs::read_dir(&t_dir) else {
+        return written;
+    };
+    let movers: Vec<PathBuf> = entries.flatten().map(|e| e.path()).collect();
+    if movers.iter().any(|m| {
+        m.file_name().is_some_and(|name| dest.join(name).exists())
+    }) {
+        return written;
+    }
+    for m in &movers {
+        let Some(name) = m.file_name() else { continue };
+        if std::fs::rename(m, dest.join(name)).is_err() {
+            return written;
+        }
+    }
+    let _ = std::fs::remove_dir(&t_dir);
+    written
+        .into_iter()
+        .map(|e| e.strip_prefix(&t_dir).map(|rel| dest.join(rel)).unwrap_or(e))
+        .collect()
+}
+
 // ---------------------------------------------------------------- 权限还原
 
 /// 条目名归一(边信道 map 键):`\`→`/`、去 `./` 前缀与尾部 `/`。
