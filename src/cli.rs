@@ -1130,6 +1130,7 @@ mod tests {
             },
             out: out.clone(),
             recursive: true,
+            no_recursive: false,
         };
         assert_eq!(cmd_extract(&args).unwrap(), 0);
         assert_eq!(std::fs::read(out.join("leaf.sh")).unwrap(), payload, "最内层叶子应直达落盘");
