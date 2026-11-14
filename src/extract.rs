@@ -340,25 +340,30 @@ mod tests {
 
     #[test]
     fn zip_modes_reads_unix_external_attrs() {
-        // 用 zip crate 造:unix 755 文件 + unix 目录 + dos-made 文件(应缺席)
+        // 用 zip crate 造:unix 755 文件 + unix 目录 + dos-made 文件(应缺席)。
+        // 注意:zip crate 的 made-by 字节默认跟随当前系统,必须显式 system(),
+        // 否则 Windows 上 unix_permissions 不会写入 unix external attr。
         let path = std::env::temp_dir().join(format!("anyarc_zipmode_{}.zip", std::process::id()));
         let mut zw = zip::ZipWriter::new(std::fs::File::create(&path).unwrap());
-        let unix_opts: zip::write::FileOptions<'_, '_, ()> =
-            zip::write::FileOptions::default().unix_permissions(0o755);
+        let unix_opts: zip::write::FileOptions<'_, '_, ()> = zip::write::FileOptions::default()
+            .system(zip::System::Unix)
+            .unix_permissions(0o755);
         zw.start_file("bin/tool", unix_opts).unwrap();
         std::io::Write::write_all(&mut zw, b"#!/bin/sh\n").unwrap();
-        let dir_opts: zip::write::FileOptions<'_, '_, ()> =
-            zip::write::FileOptions::default().unix_permissions(0o755);
+        let dir_opts: zip::write::FileOptions<'_, '_, ()> = zip::write::FileOptions::default()
+            .system(zip::System::Unix)
+            .unix_permissions(0o755);
         zw.add_directory("scripts/", dir_opts).unwrap();
-        let dos_opts: zip::write::FileOptions<'_, '_, ()> = zip::write::FileOptions::default(); // made_by=dos
+        let dos_opts: zip::write::FileOptions<'_, '_, ()> =
+            zip::write::FileOptions::default().system(zip::System::Dos);
         zw.start_file("dos.txt", dos_opts).unwrap();
         std::io::Write::write_all(&mut zw, b"x").unwrap();
         zw.finish().unwrap();
         let m = zip_modes(&path).unwrap();
         assert_eq!(m.get("bin/tool"), Some(&0o755));
         assert_eq!(m.get("scripts"), Some(&0o755)); // 目录尾斜杠已归一
-        // zip crate 默认 unix-made 且带 0o644:如实读出(真 attr=0 退化条目由 mode!=0 过滤,e2e 覆盖)
-        assert_eq!(m.get("dos.txt"), Some(&0o644));
+        // dos-made 条目无 unix attr:不参与还原(真 unix 档退化 attr=0 同理,mode!=0 过滤)
+        assert_eq!(m.get("dos.txt"), None);
         std::fs::remove_file(&path).unwrap();
     }
 
