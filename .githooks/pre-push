@@ -1,0 +1,10 @@
+#!/bin/sh
+# 推送门禁:所有测试(单元 + tests/regression.rs 需求验收)必须通过才允许 push。
+# 启用(仓库内已配置;克隆后每人执行一次):
+#   git config core.hooksPath .githooks
+echo "pre-push: cargo test --release ..." >&2
+cargo test --release --quiet >&2 || {
+    echo "pre-push: 测试未通过,拒绝 push" >&2
+    exit 1
+}
+echo "pre-push: 测试全绿,允许 push" >&2

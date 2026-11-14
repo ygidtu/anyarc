@@ -72,8 +72,63 @@ pub fn is_tty() -> bool {
     std::io::stdout().is_terminal()
 }
 
+/// --smart 规则 B:目录里只剩**唯一一项且与目录同名**(`novel/novel`)时,
+/// 把该项提升到目录同级、删除空壳目录 —— 提升后条目路径恰好接管原目录路径。
+/// 成功返回 True(目录路径语义已变:目录→条目)。
+pub fn collapse_dup_wrapper(dir: &Path) -> bool {
+    let Some(name) = dir.file_name() else {
+        return false; // "." 等无名目录不做提升
+    };
+    let Some(parent) = dir.parent() else {
+        return false;
+    };
+    if !dir.is_dir() {
+        return false;
+    }
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return false;
+    };
+    let entries: Vec<PathBuf> = rd.flatten().map(|e| e.path()).collect();
+    if entries.len() != 1 || entries[0].file_name() != Some(name) {
+        return false;
+    }
+    // 暂名 → 删空壳 → 归位(处理"提升到自身路径"的名字冲突)
+    let tmp = parent.join(format!(".anyarc_lift_{}", std::process::id()));
+    if std::fs::rename(&entries[0], &tmp).is_err() {
+        return false;
+    }
+    if std::fs::remove_dir(dir).is_err() {
+        let _ = std::fs::rename(&tmp, &entries[0]);
+        return false;
+    }
+    std::fs::rename(&tmp, dir).is_ok()
+}
+
+/// --smart 完整后处理:A(同名目录包裹合并)+ B(单条目同名提升);
+/// 返回路径重映射后的条目列表。
+pub fn smart_adjust(dest: &Path, written: Vec<PathBuf>) -> Vec<PathBuf> {
+    let mut w = flatten_dup_wrappers(dest, written);
+    if collapse_dup_wrapper(dest) {
+        // dest 由"目录"变成"条目本身":原 dest/<同名>/… 路径全部改挂 dest
+        let inner_root = dest.join(dest.file_name().unwrap_or_default());
+        w = w
+            .into_iter()
+            .map(|e| {
+                if e == inner_root {
+                    dest.to_path_buf()
+                } else if let Ok(r) = e.strip_prefix(&inner_root) {
+                    dest.join(r)
+                } else {
+                    e
+                }
+            })
+            .collect();
+    }
+    w
+}
+
 /// --smart:本层解压内容若整体位于一个与上级目录**同名**的文件夹内
-/// (典型:763.tar.gz 解出 763/,而它已在 763/ 下 → 763/763/),把内容
+/// (典型:book.tar.gz 解出 book/,而它已在 book/ 下 → book/book/),把内容
 /// 上移一层、删掉重复包裹。冲突或异常时保持原样。返回更新后的路径列表。
 pub fn flatten_dup_wrappers(dest: &Path, written: Vec<PathBuf>) -> Vec<PathBuf> {
     if written.is_empty() {

@@ -8,6 +8,7 @@
 
 pub mod rar;
 pub mod unarc;
+pub mod zipspan;
 
 use std::path::{Path, PathBuf};
 

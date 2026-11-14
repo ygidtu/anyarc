@@ -89,7 +89,7 @@ pub struct ExtractArgs {
     /// 递归解压:解出的文件若仍是可识别归档,继续向内解一层(中间归档移除)
     #[arg(short = 'r', long)]
     pub recursive: bool,
-    /// 智能扁平:解压内容若被同名顶层目录包裹(763/763/)则合并一层;配合 --recursive
+    /// 智能扁平:解压内容若被同名顶层目录包裹(book/book/)则合并一层;配合 --recursive
     #[arg(long)]
     pub smart: bool,
 }
@@ -348,7 +348,7 @@ pub fn cmd_extract(args: &ExtractArgs) -> anyhow::Result<u8> {
         let canon = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
         if consumed.contains(&canon) {
             if !args.common.quiet {
-                eprintln!("跳过 {}:它是前面那个压缩包的分卷之一,已一并处理", path.display());
+                eprintln!("跳过 {path:?}:已处理过(同一档案或卷集的重复参数)");
             }
             continue;
         }
@@ -357,6 +357,7 @@ pub fn cmd_extract(args: &ExtractArgs) -> anyhow::Result<u8> {
         for cp in ar.consumed_paths() {
             consumed.insert(cp);
         }
+        consumed.insert(canon.clone());
         // 归档头里没有权限信息时(zip/tar 家族),额外读一遍文件头补上
         let modes = if ar.provides_mode() {
             Default::default()
@@ -370,7 +371,7 @@ pub fn cmd_extract(args: &ExtractArgs) -> anyhow::Result<u8> {
             }
             Ok(written) => {
                 let written = if args.smart {
-                    crate::extract::flatten_dup_wrappers(&args.out, written)
+                    crate::extract::smart_adjust(&args.out, written)
                 } else {
                     written
                 };
@@ -412,12 +413,12 @@ fn peel_nested(files: &[PathBuf], args: &ExtractArgs, enc: Option<&'static encod
         match extracted {
             Ok(inner) if !inner.is_empty() => {
                 // 解出真实内容才移除中间压缩包;空产物(被覆盖策略跳过等)保留原文件
+                std::fs::remove_file(f).map_err(|e| anyhow::anyhow!("删除中间压缩包 {}: {e}", f.display()))?;
                 let inner = if args.smart {
-                    crate::extract::flatten_dup_wrappers(&dest, inner)
+                    crate::extract::smart_adjust(&dest, inner)
                 } else {
                     inner
                 };
-                std::fs::remove_file(f).map_err(|e| anyhow::anyhow!("删除中间压缩包 {}: {e}", f.display()))?;
                 if !args.common.quiet {
                     eprintln!("继续解压 {}:得到 {} 个文件(已删除中间压缩包,第 {depth} 层)", f.display(), inner.len());
                 }
@@ -1196,12 +1197,12 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
-    /// --recursive --smart:同名目录重复包裹(763/763/)自动合并成一层。
+    /// --recursive --smart:同名目录重复包裹(book/book/)自动合并成一层。
     #[test]
     fn recursive_smart_collapses_dup_dir() {
         use std::io::Write as _;
         let payload = b"final-content";
-        // tar 顶层是 763/leaf.txt
+        // tar 顶层是 book/leaf.txt
         let mut tar_bytes = Vec::new();
         {
             let mut tb = tar::Builder::new(&mut tar_bytes);
@@ -1209,7 +1210,7 @@ mod tests {
             h.set_size(payload.len() as u64);
             h.set_mode(0o644);
             h.set_cksum();
-            tb.append_data(&mut h, "763/leaf.txt", &payload[..]).unwrap();
+            tb.append_data(&mut h, "book/leaf.txt", &payload[..]).unwrap();
             tb.finish().unwrap();
         }
         let mut gzb = Vec::new();
@@ -1218,17 +1219,17 @@ mod tests {
             e.write_all(&tar_bytes).unwrap();
             e.finish().unwrap();
         }
-        // zip 里放 763/763.tar.gz(模拟网盘常见打包)
+        // zip 里放 book/book.tar.gz(模拟网盘常见打包)
         let dir = std::env::temp_dir().join(format!("anyarc_smart_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        let outer = dir.join("763.zip");
+        let outer = dir.join("book.zip");
         {
             let mut zw = zip::ZipWriter::new(std::fs::File::create(&outer).unwrap());
             let opts: zip::write::FileOptions<'_, '_, ()> =
                 zip::write::FileOptions::default().compression_method(zip::CompressionMethod::Stored);
-            zw.add_directory("763/", opts).unwrap();
-            zw.start_file("763/763.tar.gz", opts).unwrap();
+            zw.add_directory("book/", opts).unwrap();
+            zw.start_file("book/book.tar.gz", opts).unwrap();
             zw.write_all(&gzb).unwrap();
             zw.finish().unwrap();
         }
@@ -1248,10 +1249,10 @@ mod tests {
             smart: true,
         };
         assert_eq!(cmd_extract(&args).unwrap(), 0);
-        // 期望:o/763/leaf.txt(只有一层 763)
-        assert!(out.join("763/leaf.txt").exists(), "最终 763/ 应在输出目录下");
-        assert!(!out.join("763/763").exists(), "重复包裹的 763/763/ 应被合并");
-        assert_eq!(std::fs::read(out.join("763/leaf.txt")).unwrap(), payload);
+        // 期望:o/book/leaf.txt(只有一层 book)
+        assert!(out.join("book/leaf.txt").exists(), "最终 book/ 应在输出目录下");
+        assert!(!out.join("book/book").exists(), "重复包裹的 book/book/ 应被合并");
+        assert_eq!(std::fs::read(out.join("book/leaf.txt")).unwrap(), payload);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -1285,6 +1286,128 @@ mod tests {
         };
         assert_eq!(cmd_extract(&args).unwrap(), 0);
         assert_eq!(std::fs::read(out.join("one.txt")).unwrap(), b"1");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// --recursive --smart:目录内仅剩与目录同名的单条目(novel/novel 文件)时,
+    /// 条目提升到压缩包同级、删除空壳目录。
+    #[test]
+    fn recursive_smart_lifts_single_samename() {
+        use std::io::Write as _;
+        let payload = b"final-payload-novel";
+        // tar 根:单文件 "novel"
+        let mut tar_bytes = Vec::new();
+        {
+            let mut tb = tar::Builder::new(&mut tar_bytes);
+            let mut h = tar::Header::new_gnu();
+            h.set_size(payload.len() as u64);
+            h.set_mode(0o644);
+            h.set_cksum();
+            tb.append_data(&mut h, "novel", &payload[..]).unwrap();
+            tb.finish().unwrap();
+        }
+        let mut gzb = Vec::new();
+        {
+            let mut e = flate2::write::GzEncoder::new(&mut gzb, flate2::Compression::default());
+            e.write_all(&tar_bytes).unwrap();
+            e.finish().unwrap();
+        }
+        let dir = std::env::temp_dir().join(format!("anyarc_lift_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let outer = dir.join("novel.zip");
+        {
+            let mut zw = zip::ZipWriter::new(std::fs::File::create(&outer).unwrap());
+            let opts: zip::write::FileOptions<'_, '_, ()> =
+                zip::write::FileOptions::default().compression_method(zip::CompressionMethod::Stored);
+            zw.add_directory("novel/", opts).unwrap();
+            zw.start_file("novel/novel.tar.gz", opts).unwrap();
+            zw.write_all(&gzb).unwrap();
+            zw.finish().unwrap();
+        }
+        // 无 smart:novel/novel 文件(中间包已删)
+        let o1 = dir.join("o1");
+        let args1 = ExtractArgs {
+            common: CommonArgs { archives: vec![outer.clone()], password: None, overwrite: false, encoding: None, max_entry_size: None, max_total_size: None, quiet: true },
+            out: o1.clone(),
+            recursive: true,
+            smart: false,
+        };
+        assert_eq!(cmd_extract(&args1).unwrap(), 0);
+        assert!(o1.join("novel/novel").is_file(), "无 smart:嵌套保留");
+        // 有 smart:./novel 为文件,空壳目录消失
+        let o2 = dir.join("o2");
+        let args2 = ExtractArgs {
+            common: CommonArgs { archives: vec![outer], password: None, overwrite: false, encoding: None, max_entry_size: None, max_total_size: None, quiet: true },
+            out: o2.clone(),
+            recursive: true,
+            smart: true,
+        };
+        assert_eq!(cmd_extract(&args2).unwrap(), 0);
+        assert!(o2.join("novel").is_file(), "smart:条目应提升到同级");
+        assert_eq!(std::fs::read(o2.join("novel")).unwrap(), payload);
+        assert!(!o2.join("novel/novel").exists(), "空壳目录应被删除");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Info-ZIP 风格分卷 zip:.z01+.zip 虚拟串联解压(内容+权限)
+    #[test]
+    fn spanned_zip_extract() {
+        use std::io::Cursor;
+        // 1) 原始单文件 zip(stored,2 条)
+        let mut orig: Vec<u8> = Vec::new();
+        {
+            let mut zw = zip::ZipWriter::new(Cursor::new(&mut orig));
+            let o1: zip::write::FileOptions<'_, '_, ()> =
+                zip::write::FileOptions::default().unix_permissions(0o755);
+            zw.start_file("dir/run.sh", o1).unwrap();
+            std::io::Write::write_all(&mut zw, b"#!/bin/sh\nhi\n").unwrap();
+            let o2: zip::write::FileOptions<'_, '_, ()> = zip::write::FileOptions::default();
+            zw.start_file("dir/blob.bin", o2).unwrap();
+            std::io::Write::write_all(&mut zw, &vec![0x42u8; 4096]).unwrap();
+            zw.finish().unwrap();
+        }
+        // 2) 找 EOCD → cd_off/cd_size → 在 CD 中部切一刀(z01 含 CD 前半)
+        let eocd_pos = (0..orig.len().saturating_sub(21)).rev().find(|i| &orig[*i..*i + 4] == b"PK\x05\x06").unwrap();
+        let cd_size = u32::from_le_bytes(orig[eocd_pos + 12..eocd_pos + 16].try_into().unwrap()) as usize;
+        let cd_off = u32::from_le_bytes(orig[eocd_pos + 16..eocd_pos + 20].try_into().unwrap()) as usize;
+        let cut = cd_off + cd_size / 2;
+        let mut last = orig[cut..].to_vec();
+        // 模拟分卷元数据:末卷 EOCD this-disk=1(CD 起始盘保持 0,zip -s 行为)
+        let eo_in_last = last.len() - 22;
+        last[eo_in_last + 4..eo_in_last + 6].copy_from_slice(&1u16.to_le_bytes());
+        let dir = std::env::temp_dir().join(format!("anyarc_spanzip_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("x.z01"), &orig[..cut]).unwrap();
+        std::fs::write(dir.join("x.zip"), &last).unwrap();
+        // 3) extract(传末卷;传 z01 也应同样工作,第二断言)
+        for entry in ["x.zip", "x.z01"] {
+            let out = dir.join(format!("o_{}", entry.replace('.', "_")));
+            let args = ExtractArgs {
+                common: CommonArgs {
+                    archives: vec![dir.join(entry)],
+                    password: None,
+                    overwrite: false,
+                    encoding: None,
+                    max_entry_size: None,
+                    max_total_size: None,
+                    quiet: true,
+                },
+                out: out.clone(),
+                recursive: false,
+                smart: false,
+            };
+            assert_eq!(cmd_extract(&args).unwrap(), 0, "entry={entry}");
+            assert_eq!(std::fs::read(out.join("dir/run.sh")).unwrap(), b"#!/bin/sh\nhi\n", "entry={entry}");
+            assert_eq!(std::fs::read(out.join("dir/blob.bin")).unwrap().len(), 4096, "entry={entry}");
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let md = std::fs::metadata(out.join("dir/run.sh")).unwrap().permissions();
+                assert_eq!(md.mode() & 0o777, 0o755, "分卷 zip 权限还原 entry={entry}");
+            }
+        }
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

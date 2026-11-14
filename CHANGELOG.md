@@ -30,19 +30,35 @@
   RAR5 symlink/hardlink(redirection)按特殊条目跳过
 - M5+ `extract --recursive/-r`(显式开启):解出的文件若仍是压缩包则继续向内解压、
   移除中间压缩包,一次直达最内层叶子;新增 `--smart` 智能扁平——解压内容被同名
-  顶层目录重复包裹(763/763/)时自动合并一层
+  顶层目录重复包裹(book/book/)时自动合并一层
 - M5++ RAR 分卷智能识别(不依赖文件名):首卷主头无卷号字段(WinRAR 行为)时,
   回退按文件名 partN 序号串联卷组(扩展名改坏也能解),并要求同 stem 前缀防误连;
   同一卷集的多个文件作参数自动去重;解压失败清理半成品输出
+- M6 测试门禁与需求验收矩阵:
+  - 新增 `tests/regression.rs`:17 个 CLI 二进制级用例,文件头维护
+    "需求 ↔ 用例"对照表;新需求须同批补用例
+  - GitHub Actions CI(Linux/Windows/macOS 三平台矩阵,`cargo test --release` 全绿门禁)
+  - 本地 pre-push hook(`.githooks/pre-push`;克隆后 `git config core.hooksPath .githooks`
+    启用,push 前自动跑全量测试)
+  - README 重写为 GitHub 风格(badge/目录/特性表/快速上手/格式矩阵)
 - M4 发布工程:
-  - `anyarc completions <bash|zsh|fish|elvish|powershell>` 生成 shell 补全脚本
-  - `anyarc man` 输出 roff man page(`anyarc man | man -l -`)
+  - `anyarc completions <bash|zsh|fish|elvish|powershell>` 生成 shell 补全脚本  - `anyarc man` 输出 roff man page(`anyarc man | man -l -`)
   - release profile 静态化调优(LTO/strip/panic=abort);
     x86_64-unknown-linux-musl 全静态二进制 6.3 MB,`ldd` 无依赖
   - cargo-dist 配置与多平台发布矩阵(见 `dist.toml` / `.github/workflows/release.yml`)
 - `poc/e2e.sh`:133 fixture CLI 端到端冒烟固化脚本
 
 ### 修复
+- Info-ZIP 分卷 zip(.z01/.z02/…+.zip 末卷)支持:此前 `.zNN` 扩展名直接
+  "无法识别",末卷 `.zip` 因文件头是数据流中段、中央目录虚拟偏移越出末卷
+  尺寸而无法归类;现按扩展名路由 + 末卷 EOCD/兄弟卷存在性智能识别,
+  任传一卷自动串联完整卷组(实测 18GB/26 文件卷集可列可解)。
+  实现:自建虚拟串联流并原地修补 EOCD/ZIP64/CD 的磁盘号与相对偏移字段
+  (兼容 WinRAR 与 Info-ZIP 两种偏移约定);条目元数据只读中央目录,
+  加密条目的密码提示流程在解压前即可正确触发;数据读取全流式
+- 注:Info-ZIP `zip -s` 3.0 的产物本身偏移错乱(官方 unzip 亦无法解压,
+  首卷开头连 PK 魔数都被切坏),此类坏档解压时给出"制作工具写坏偏移"
+  的明确报错,已属极限兼容
 - 流式解压的大文件不再被 `--max-entry-size`(默认 4 GiB)误杀:该限额只约束
   "整体读入内存"的老路径(防 OOM);流式直写改由 `--max-total-size`(默认
   32 GiB)兜底,并在 extract 增加跨条目累计总量预算

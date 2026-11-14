@@ -216,9 +216,8 @@ pub fn open(path: &Path, det: &Detected, opts: &OpenOptions) -> anyhow::Result<B
         }
     if kind == ArchiveFormat::Zip
         && let Some(vols) = collect_zip_volumes(path) {
-            let a = ArchiveFormat::open_multi_volume_zip(&vols, to_opts(opts))
-                .map_err(|e| anyhow::anyhow!("{e}"))?;
-            return Ok(Box::new(UnarcBackend { inner: boxed(a), current: None, max_entry_size: opts.max_entry_size }));
+            // 分卷 zip:zip crate 拒绝 multi-disk,走自建虚拟串联后端
+            return Ok(Box::new(crate::backend::zipspan::open(&vols, opts)?));
         }
 
     let file = BufReader::new(File::open(path)?);

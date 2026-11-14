@@ -1,0 +1,22 @@
+# 测试门禁:push / PR 必须全绿(单元 + tests/regression.rs 需求验收套件)
+# 本地配套:git config core.hooksPath .githooks(pre-push 同样跑 cargo test)
+name: CI
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v6
+      - name: cargo test (unit + regression)
+        run: cargo test --release
+      - name: cargo clippy (advisory)
+        run: cargo clippy --all-targets
+        continue-on-error: true

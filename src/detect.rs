@@ -185,6 +185,16 @@ pub fn detect(path: &Path) -> std::io::Result<Option<Detected>> {
             return Ok(Some(Detected { kind: Known::Unarc(ArchiveFormat::Zip), prefix_bytes: prefix }));
         }
 
+    // 5) 分卷 zip 末卷(Info-ZIP 风格 .z01…+ .zip):本卷文件头是数据流中段,
+    //    中央目录指向前置兄弟卷(虚拟偏移越出末卷尺寸)→ EOCD 有效且存在
+    //    兄弟卷时按卷集归类,打开时自动串联
+    if base.is_none()
+        && zip_spanned_tail(&mut file)?
+        && has_zip_sibling_parts(path)
+    {
+        return Ok(Some(Detected { kind: Known::Unarc(ArchiveFormat::Zip), prefix_bytes: 0 }));
+    }
+
     Ok(base.map(|kind| Detected { kind, prefix_bytes: 0 }))
 }
 
@@ -239,7 +249,14 @@ fn ext_hint(path: &Path) -> Option<Known> {
         "deb" => Known::Container(Container::Deb),
         "rpm" => Known::Container(Container::Rpm),
         "ar" | "a" => Known::Container(Container::Ar),
-        _ => return None,
+        _ => {
+            // Info-ZIP 分卷 zip 的中卷(.z01/.z02…):内容是数据流中段,
+            // 文件头没有魔数,按扩展名归类(打开时自动串联卷组)
+            if ext.len() == 3 && ext.starts_with('z') && ext[1..].bytes().all(|b| b.is_ascii_digit()) {
+                return Some(Known::Unarc(ArchiveFormat::Zip));
+            }
+            return None;
+        }
     };
     Some(k)
 }
@@ -456,6 +473,62 @@ pub fn eocd_scan(file: &mut File) -> std::io::Result<Option<u64>> {
     Ok(None)
 }
 
+/// 分卷 zip 末卷判定:尾部窗口有结构一致的 EOCD,且中央目录(含 zip64 实际值)
+/// 的虚拟偏移越出本文件尺寸 → CD 在前置兄弟卷里
+fn zip_spanned_tail(file: &mut File) -> std::io::Result<bool> {
+    let len = file.seek(SeekFrom::End(0))?;
+    if len < 22 {
+        return Ok(false);
+    }
+    let win = len.min(EOCD_WINDOW);
+    file.seek(SeekFrom::End(-(win as i64)))?;
+    let mut tail = vec![0u8; win as usize];
+    file.read_exact(&mut tail)?;
+    let mut j = tail.len().saturating_sub(4);
+    loop {
+        if &tail[j..j + 4] == EOCD_MAGIC && j + 22 <= tail.len() {
+            let e = &tail[j..];
+            let comment_len = u16::from_le_bytes([e[20], e[21]]) as usize;
+            if j + 22 + comment_len == tail.len() {
+                let entries = u16::from_le_bytes([e[10], e[11]]) as u64;
+                let cd_size = u32::from_le_bytes(e[12..16].try_into().unwrap()) as u64;
+                let cd_off = u32::from_le_bytes(e[16..20].try_into().unwrap()) as u64;
+                if (cd_off == 0xFFFF_FFFF || entries == 0xFFFF)
+                    && j >= 20
+                    && &tail[j - 20..j - 16] == ZIP64_EOCD_LOCATOR_MAGIC {
+                    let z64_off = u64::from_le_bytes(tail[j - 16..j - 8].try_into().unwrap());
+                    if let Some((_, c64, s64)) = read_zip64_eocd(file, z64_off) {
+                        return Ok(c64 + s64 > len);
+                    }
+                } else if entries < 0xFFFF {
+                    // 非 zip64 分卷(小档):CD 虚拟位置出界且超出量合理(<16GiB 前置)
+                    return Ok(cd_off + cd_size > len && cd_off + cd_size - len < (16u64 << 30));
+                }
+            }
+        }
+        if j == 0 {
+            break;
+        }
+        j -= 1;
+    }
+    Ok(false)
+}
+
+/// 同目录是否存在 stem.zNN 兄弟卷(1..=999)
+fn has_zip_sibling_parts(path: &Path) -> bool {
+    let Some(dir) = path.parent() else {
+        return false;
+    };
+    let Some(name) = path.file_name().and_then(|s| s.to_str()) else {
+        return false;
+    };
+    let lower = name.to_lowercase();
+    let Some(stem) = lower.strip_suffix(".zip") else {
+        return false;
+    };
+    (1..=999u32).any(|i| dir.join(format!("{stem}.z{i:02}")).is_file())
+}
+
 fn read_zip64_eocd(file: &mut File, off: u64) -> Option<(u64, u64, u64)> {
     file.seek(SeekFrom::Start(off)).ok()?;
     let mut h = [0u8; 12];
@@ -559,5 +632,45 @@ mod tests {
             // 纯 zip:aes.zip 无前置数据
             let _ = f;
         }
+    }
+
+    #[test]
+    fn ext_hint_maps_znn_split_parts_to_zip() {
+        use std::path::Path;
+        assert!(matches!(ext_hint(Path::new("a.z01")), Some(Known::Unarc(ArchiveFormat::Zip))));
+        assert!(matches!(ext_hint(Path::new("a.Z07")), Some(Known::Unarc(ArchiveFormat::Zip))));
+        assert!(ext_hint(Path::new("a.zipp")).is_none());
+        assert!(ext_hint(Path::new("a.y01")).is_none());
+    }
+
+    #[test]
+    fn spanned_zip_tail_detected() {
+        // 合成 Info-ZIP 分卷:z01 含 CD(偏移 60),zip 末卷 EOCD 指向虚拟流位置
+        let dir = std::env::temp_dir().join(format!("anyarc_spanned_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut z01 = vec![0u8; 60];
+        z01.extend_from_slice(b"PK\x01\x02"); // CD 头签名
+        z01.extend_from_slice(&[0u8; 44]); // 固定区补齐(46B 头)
+        z01.extend_from_slice(&[0u8; 10]);
+        let mut last = vec![0u8; 50];
+        // EOCD:entries=1, cd_size=46, cd_off=60, comment=0
+        let mut eocd = vec![0u8; 22];
+        eocd[0..4].copy_from_slice(b"PK\x05\x06");
+        eocd[8..10].copy_from_slice(&1u16.to_le_bytes()); // entries on disk
+        eocd[10..12].copy_from_slice(&1u16.to_le_bytes()); // entries total
+        eocd[12..16].copy_from_slice(&46u32.to_le_bytes()); // cd size
+        eocd[16..20].copy_from_slice(&60u32.to_le_bytes()); // cd off(虚拟流,在 z01 内)
+        last.extend_from_slice(&eocd);
+        std::fs::write(dir.join("v.z01"), &z01).unwrap();
+        let p = dir.join("v.zip");
+        std::fs::write(&p, &last).unwrap();
+
+        let mut f = std::fs::File::open(&p).unwrap();
+        assert!(zip_spanned_tail(&mut f).unwrap(), "EOCD 有效且 CD 出界应判定 spanned");
+        assert!(has_zip_sibling_parts(&p));
+        let d = detect(&p).unwrap().unwrap();
+        assert!(matches!(d.kind, Known::Unarc(ArchiveFormat::Zip)), "{:?}", d.kind);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

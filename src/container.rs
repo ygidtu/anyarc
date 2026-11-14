@@ -196,7 +196,7 @@ impl ArchiveBackend for ContainerBackend {
 }
 
 /// 分块转发 r → w(每块触发调用方的进度回调)。
-fn copy_chunks(mut r: impl Read, w: &mut dyn Write) -> anyhow::Result<u64> {
+pub(crate) fn copy_chunks(mut r: impl Read, w: &mut dyn Write) -> anyhow::Result<u64> {
     let mut buf = vec![0u8; crate::backend::WRITE_CHUNK];
     let mut total = 0u64;
     loop {

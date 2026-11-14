@@ -675,10 +675,10 @@ mod name_tests {
     #[test]
     fn part_number_survives_broken_extension() {
         // 用户把扩展名改坏(r删除ar),partN 序号仍可从文件名取得
-        let p = Path::new("foxb31-32.part2.r删除ar");
+        let p = Path::new("game01-02.part2.r删除ar");
         assert_eq!(part_number_in_name(p), Some(2));
-        assert_eq!(volume_stem(p).as_deref(), Some("foxb31-32."));
-        assert_eq!(part_number_in_name(Path::new("SF2.PART10.RAR")), Some(10));
+        assert_eq!(volume_stem(p).as_deref(), Some("game01-02."));
+        assert_eq!(part_number_in_name(Path::new("GAME.PART10.RAR")), Some(10));
         assert_eq!(part_number_in_name(Path::new("plain.rar")), None);
         assert_eq!(volume_stem(Path::new("plain.rar")), None);
     }
